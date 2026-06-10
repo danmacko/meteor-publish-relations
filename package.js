@@ -1,7 +1,7 @@
 Package.describe({
   name: 'danmacko:publish-relations',
   summary: 'Edit your documents before sending without too much stress (maintained fork of cottz:publish-relations)',
-  version: '2.0.8',
+  version: '2.0.9',
   git: 'https://github.com/danmacko/meteor-publish-relations',
   documentation: 'README.md'
 });
