@@ -1,5 +1,8 @@
-Cottz publish-relations
+publish-relations
 =============================
+
+> **Maintained fork of [cottz:publish-relations](https://github.com/lfades/cottz-publish-relations) by [lfades](https://github.com/lfades) (MIT).**
+> Includes bug fixes and improvements over the original — see the [releases](https://github.com/danmacko/meteor-publish-relations/releases).
 
 Edit your documents before sending without too much stress.
 provides a number of methods to easily manipulate data using internally observe and observeChanges in the server
@@ -7,7 +10,7 @@ provides a number of methods to easily manipulate data using internally observe 
 ## Installation
 
 ```sh
-$ meteor add cottz:publish-relations
+$ meteor add danmacko:publish-relations
 ```
 
 ## Quick Start
@@ -38,7 +41,7 @@ Assuming we have the following collections
 ```
 I want publish the autor with his books and comments of the books and I want to show only some interests of the author
 ```js
-import PublishRelations from 'meteor/cottz:publish-relations';
+import PublishRelations from 'meteor/danmacko:publish-relations';
 
 PublishRelations('author', function (authorId) {
   this.cursor(Authors.find(authorId), function (id, doc) {
@@ -131,7 +134,7 @@ page within an array without re run the publication or callback
 ### this.listen (data, callback, run)
 It allows you to execute a part of the publication when the client asks for it. It is easier to explain with an example
 ```js
-import PublishRelations from 'meteor/cottz:publish-relations';
+import PublishRelations from 'meteor/danmacko:publish-relations';
 
 PublishRelations('books', function (data) {
   const pattern = {

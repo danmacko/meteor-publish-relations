@@ -1,8 +1,8 @@
 Package.describe({
-  name: 'cottz:publish-relations',
-  summary: 'Edit your documents before sending without too much stress',
+  name: 'danmacko:publish-relations',
+  summary: 'Edit your documents before sending without too much stress (maintained fork of cottz:publish-relations)',
   version: '2.0.8',
-  git: 'https://github.com/Goluis/cottz-publish-relations',
+  git: 'https://github.com/danmacko/meteor-publish-relations',
   documentation: 'README.md'
 });
 
@@ -29,7 +29,7 @@ Package.onTest(function (api) {
     'random',
     'mongo',
     'ddp',
-    'cottz:publish-relations'
+    'danmacko:publish-relations'
   ]);
 
   api.mainModule('tests/index.js');
