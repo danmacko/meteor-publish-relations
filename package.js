@@ -10,10 +10,7 @@ Package.onUse(function (api) {
   api.versionsFrom('1.5.1');
 
   api.use([
-    'ecmascript',
-    'check',
-    'ddp-server',
-    'underscore'
+    'ecmascript'
   ]);
 
   api.mainModule('lib/server/index.js', 'server');
