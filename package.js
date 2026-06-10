@@ -16,7 +16,6 @@ Package.onUse(function (api) {
     'underscore'
   ]);
 
-  api.mainModule('lib/client/publish_relations.js', 'client');
   api.mainModule('lib/server/index.js', 'server');
 
   api.export('PublishRelations', 'server');

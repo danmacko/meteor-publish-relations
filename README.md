@@ -39,7 +39,7 @@ Assuming we have the following collections
   text: 'This book is better than meteor for pros :O'
 }
 ```
-I want publish the autor with his books and comments of the books and I want to show only some interests of the author
+I want publish the autor with his books and comments of the books
 ```js
 import PublishRelations from 'meteor/danmacko:publish-relations';
 
@@ -48,15 +48,10 @@ PublishRelations('author', function (authorId) {
     this.cursor(Books.find({authorId: id}), function (id, doc) {
       this.cursor(Comments.find({bookId: id}));
     });
-
-    doc.interests = this.paginate({interests: doc.interests}, 5);
   });
 
   return this.ready();
 });
-// Client
-// skip 5 interest and show the next 5
-PublishRelations.changePag({_id: 'authorId', field: 'interests', skip: 5});
 ```
 Note: The above code is very nice and works correctly, but I recommend that you read the Performance Notes
 ## Main API
@@ -119,61 +114,8 @@ It has 2 differences with `this.cursor`
 ### this.joinNonreactive (Collection, options, name)
 Is exactly the same as `this.join` but non reactive
 
-## Crossbar API
-The following methods use `Meteor Crossbar` which allows the client to communicate with a publication without re-run the publication
-
-### this.paginate (field, limit, infinite)
-page within an array without re run the publication or callback
-
-* returns the paginated array, be sure to change it in the document
-* **field** is an object where the key is the field in the document and the value an array
-* **limit** the total number of values in the array to show
-* **infinite** if true the above values are not removed when the paging is increased
-* **PublishRelations.changePag({_id, field, skip})** change the pagination of the document with that `id` and `field`. `skip` is the number of values to skip.
-
-### this.listen (data, callback, run)
-It allows you to execute a part of the publication when the client asks for it. It is easier to explain with an example
-```js
-import PublishRelations from 'meteor/danmacko:publish-relations';
-
-PublishRelations('books', function (data) {
-  const pattern = {
-    authorId: String,
-    skip: Match.Integer
-  };
-  check(data, pattern);
-
-  if (!this.userId || !Meteor.users.findOne({_id: this.userId}))
-    return this.ready();
-  // Maybe you have roles or another validations here
-
-  // If inside this.listen you'll use this, make sure to use an arrow function
-  this.listen(data, (runBeforeReady) => {
-    if (!runBeforeReady)
-      check(data, pattern);
-
-    this.cursor(Books.find({authorId: data.authorId}, {
-      limit: 10,
-      skip: data.skip
-    }));
-  });
-
-  return this.ready();
-});
-
-// -- client --
-Meteor.subscribe('books', {authorId: 'authorId', skip: 0});
-// skip 10 books and show the next 10
-// the second param must be an object
-PublishRelations.fire('books', {authorId: 'authorId', skip: 10});
-```
-each time that you use `PublishRelations.fire` the listen callback is rerun, the param `data` that you sent in listen extends with the data sent in the `fire` event
-- `run` is a boolean value (default true). if true `callback` is executed immediately within the publication before the first `fire`
-- `callback` only receives the boolean parameter `runBeforeReady` that is only true when `run` is true and the `callback` runs for first time
--  you can have only one `listen` by publication
-
 ## Performance Notes
-* all methods returns an object with the stop() method except for paginate
+* all methods returns an object with the stop() method
 * all cursors are stopped when the publication stop
 * when the parent cursor is stopped or a document with cursors is removed all related cursors are stopped
 * all cursors use basic observeChanges as meteor does by default, performance does not come down
