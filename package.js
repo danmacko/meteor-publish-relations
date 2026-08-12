@@ -28,5 +28,5 @@ Package.onTest(function (api) {
     'danmacko:publish-relations'
   ]);
 
-  api.mainModule('tests/index.js');
+  api.mainModule('tests/index.js', 'server');
 });

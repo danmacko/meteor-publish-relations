@@ -1,8 +1,24 @@
+import { Meteor } from 'meteor/meteor';
 import { Tinytest } from 'meteor/tinytest';
 import { Mongo } from 'meteor/mongo';
 import { Random } from 'meteor/random';
-import PublishRelations from 'meteor/cottz:publish-relations';
+import PublishRelations from 'meteor/danmacko:publish-relations';
 import { data, Client } from './data';
+
+Tinytest.add('Package - exported API surface', function (test) {
+  // package.js promises three entry points and nothing else in the suite
+  // touches two of them: the api.export global, and Meteor.publishRelations.
+  // They would break silently if publish_relations.js ever declared its
+  // function with const/let instead of the bare assignment api.export needs.
+  test.equal(typeof PublishRelations, 'function', 'default import is callable');
+  test.equal(typeof Meteor.publishRelations, 'function', 'Meteor.publishRelations is installed');
+  test.isTrue(Meteor.publishRelations === PublishRelations, 'Meteor.publishRelations is the same function');
+
+  const pkg = Package['danmacko:publish-relations'];
+  test.isTrue(!!pkg, 'package is registered under its Atmosphere name');
+  test.equal(typeof pkg.PublishRelations, 'function', "api.export('PublishRelations') resolves");
+  test.isTrue(pkg.PublishRelations === PublishRelations, 'the exported global is the same function');
+});
 
 Tinytest.addAsync('Cursor', function (test, done) {
   var quotes = new Mongo.Collection(Random.id()),
@@ -15,6 +31,8 @@ Tinytest.addAsync('Cursor', function (test, done) {
 
   PublishRelations(publish, function () {
     this.cursor(quotes.find());
+  
+    return this.ready();
   });
 
   var client = Client();
@@ -54,6 +72,8 @@ Tinytest.addAsync('Observes', function (test, done) {
         test.equal(doc, quotes.findOne(id, {fields: {_id: 0}}));
       }
     });
+  
+    return this.ready();
   });
 
   var client = Client();

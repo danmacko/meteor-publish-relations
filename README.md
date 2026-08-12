@@ -185,3 +185,48 @@ return this.ready();
 return [];
 return [cursor1, cursor2, cursor3];
 ```
+
+## Testing
+
+The suite has two layers. Run both with one command:
+
+```bash
+./test.sh          # unit layer only — fast, no side effects
+./test.sh --full   # both layers (boots a Meteor test server on $PORT, default 3199)
+```
+
+**Unit layer** (`tests/unit/`) loads the server modules into a `vm` with Meteor
+stubbed out, so it runs in plain node in milliseconds — no Meteor, no MongoDB.
+That gives deterministic control over things a DDP client cannot see: what sits
+in the deferred restart queue, what happens when a release lands in the same
+tick as a push, how a subscription that is already deactivated behaves, and the
+overlap guards for two cursors publishing the same collection.
+
+```bash
+node tests/unit/run.js
+```
+
+The test scripts require Node 14.18+ (they import builtins with the `node:`
+prefix). `./test.sh` checks for that and falls back to the Node bundled with
+the Meteor tool when the system one is older or missing.
+
+**Tinytest layer** (`tests/*.js`) runs against a real Meteor server, a real
+MongoDB and a real DDP client. It owns what only the real stack can show: DDP
+message order, and the observer lifecycle — leaks, replacement on restart, and
+teardown. Observer counts are read from `MongoInternals`, because a leaked
+observer is invisible from the client side.
+
+Every test in this package is server-side, so no browser is needed. Instead of
+the browser reporter (or `test-in-console`, which drives headless Chrome via
+puppeteer), `tests/headless-driver.js` speaks raw DDP to the test server and
+calls the `tinytest/run` method directly:
+
+```bash
+meteor test-packages --release METEOR@2.15 --port 3199 ./   # one shell
+node tests/headless-driver.js                               # another
+```
+
+It exits non-zero when a test fails, so it can gate CI.
+
+Tinytest has no built-in timeouts, so the tests use a `deadline()` helper — a
+regression must report as a failure, not hang the suite.

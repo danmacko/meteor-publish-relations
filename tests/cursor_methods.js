@@ -1,7 +1,7 @@
 import { Tinytest } from 'meteor/tinytest';
 import { Mongo } from 'meteor/mongo';
 import { Random } from 'meteor/random';
-import PublishRelations from 'meteor/cottz:publish-relations';
+import PublishRelations from 'meteor/danmacko:publish-relations';
 import { data, Client } from './data';
 
 Tinytest.addAsync('Relations - observe', function (test, done) {
@@ -41,6 +41,8 @@ Tinytest.addAsync('Relations - observe', function (test, done) {
         }
       });
     });
+  
+    return this.ready();
   });
 
   var client = Client();
@@ -83,6 +85,8 @@ Tinytest.addAsync('Relations - cursor basic', function (test, done) {
     this.cursor(quotes.find(), function (id, doc) {
       this.cursor(products.find({quoteId: id}));
     });
+  
+    return this.ready();
   });
 
   var client = Client();
@@ -146,6 +150,8 @@ Tinytest.addAsync('Relations - cursor', function (test, done) {
         prod.info = prodInfo.info;
       });
     });
+  
+    return this.ready();
   });
 
   var client = Client();
@@ -202,6 +208,8 @@ Tinytest.addAsync('Relations - changeParentDoc', function (test, done) {
 
       doc.userProfile = user.userProfile;
     });
+  
+    return this.ready();
   });
 
   var client = Client();
