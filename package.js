@@ -7,7 +7,7 @@ Package.describe({
 });
 
 Package.onUse(function (api) {
-  api.versionsFrom('1.5.1');
+  api.versionsFrom('2.3');
 
   api.use([
     'ecmascript'

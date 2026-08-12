@@ -13,6 +13,14 @@ provides a number of methods to easily manipulate data using internally observe 
 $ meteor add danmacko:publish-relations
 ```
 
+## Compatibility
+
+| | |
+|---|---|
+| **Minimum** | Meteor 2.3 — enforced by `api.versionsFrom` in `package.js` |
+| **Tested on** | Meteor 2.15 (both test layers, see [Testing](#testing)) |
+| **Meteor 3** | Not yet supported |
+
 ## Quick Start
 Assuming we have the following collections
 ```js
