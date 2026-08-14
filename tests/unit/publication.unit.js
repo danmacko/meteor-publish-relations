@@ -10,6 +10,7 @@ const MODULES = [
   'cursor/published.js',
   'cursor/contributor-context.js',
   'cursor/nonreactive/cursor.js',
+  'cursor/nonreactive/join.js',
   'handler_controller.js',
   'cursor/cursor.js',
   'cursor/utils.js',
@@ -410,6 +411,42 @@ module.exports = function run() {
     t.db.remove('posts', 'post1'); // the contributor that created the observe leaves
     t.flush();
     check('both pushes are released with it', t.db.live('authors')[0].selector._id.$in, []);
+  }
+
+  // === joinNonreactive publishes once and observes nothing =================
+  {
+    const t = build();
+    const posts = t.db.coll('posts');
+    const authors = t.db.coll('authors');
+    t.db.insert('authors', { _id: 'A1' });
+    t.db.insert('authors', { _id: 'A2' });
+    t.db.insert('posts', { _id: 'post1', authorId: 'A1' });
+
+    const handed = [];
+    let join = null;
+    t.publish(function () {
+      join = this.joinNonreactive(authors);
+      join.selector = _id => {
+        handed.push(_id.$in);
+        return { _id: _id };
+      };
+      this.cursor(posts.find({}), function (id, doc) {
+        join.push(doc.authorId);
+      });
+      join.send();
+    });
+    check('the joined doc is published', t.isPublished('authors', 'A1'), true);
+    check('and no observer was created for it', t.db.live('authors').length, 0);
+
+    join.push('A2'); // a late push has to publish on the spot
+    check('a late push is published too', t.isPublished('authors', 'A2'), true);
+
+    // The same {$in} shape both times, so a selector written for this.join fits.
+    check('the selector is always handed an $in array', handed, [['A1'], ['A2']]);
+
+    // ...and a copy of it: this.data keeps growing, the handed array must not.
+    join.push('A3');
+    check('the handed array is a copy', handed[0], ['A1']);
   }
 
   return report();

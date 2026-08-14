@@ -182,6 +182,12 @@ class FakeDB {
     return {
       _cursorDescription: { collectionName: name, selector },
       _getCollectionName: () => name,
+      // One-shot read, no observer - what the nonreactive API runs on.
+      forEach(fn) {
+        db.colls[name].forEach(doc => {
+          if (matches(doc, selector)) fn(Object.assign({}, doc));
+        });
+      },
       observeChanges(callbacks) {
         const observer = {
           coll: name,
