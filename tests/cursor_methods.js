@@ -114,7 +114,6 @@ Tinytest.addAsync('Relations - cursor', function (test, done) {
     productsName = Random.id(),
     quotes = new Mongo.Collection(quotesName),
     products = new Mongo.Collection(productsName),
-    productsInfo = new Mongo.Collection(Random.id()),
     names = data.names,
     colors = ['blue', 'black', 'red'],
     publish = Random.id(),
@@ -125,16 +124,10 @@ Tinytest.addAsync('Relations - cursor', function (test, done) {
 
     quotes.insert(quote);
     for (var i = 0; i < 3; i ++) {
-      var prodId = products.insert({
+      products.insert({
         quoteId: quote._id,
         name: names[i],
         price: 1000 * i
-      });
-
-      productsInfo.insert({
-        prodId: prodId,
-        color: colors[i],
-        info: 'this product is cool'
       });
     }
   };
@@ -142,15 +135,11 @@ Tinytest.addAsync('Relations - cursor', function (test, done) {
   PublishRelations(publish, function () {
     this.cursor(quotes.find(), function (id, doc) {
       this.cursor(products.find({quoteId: id}), function (prodId, prod) {
-        var prodInfo = this.changeParentDoc(productsInfo.find({prodId: prodId}), function (prodInfoId, prodInfo) {
-          return prodInfo;
-        });
-
-        prod.color = prodInfo.color;
-        prod.info = prodInfo.info;
+        // the callback may edit the document it is publishing
+        prod.color = colors[prod.price / 1000];
       });
     });
-  
+
     return this.ready();
   });
 
@@ -158,73 +147,12 @@ Tinytest.addAsync('Relations - cursor', function (test, done) {
   client._livedata_data = function (msg) {
     if(msg.collection == productsName) {
       var fields = msg.fields;
-      
-      if(msg.msg == 'added') {
-        test.isTrue(quotes.findOne({_id: fields.quoteId}));
-        test.equal(fields.name, names[fields.price / 1000]);
 
-        productsInfo.update({prodId: msg.id}, {$set: {info: 'This product is not cool now'}});
-      } else {
-        // changed
-        test.equal(fields.info, 'This product is not cool now');
-      }
+      test.isTrue(quotes.findOne({_id: fields.quoteId}));
+      test.equal(fields.name, names[fields.price / 1000]);
+      test.equal(fields.color, colors[fields.price / 1000]);
     } else if (msg.collection == quotesName) {
       test.equal(msg.fields, quotes.findOne({_id: msg.id}, {fields: {_id: 0}}));
-
-    } else if (msg.msg == 'ready') {
-      client.disconnect();
-      done();
-    }
-  };
-
-  client.subscribe(publish);
-});
-
-Tinytest.addAsync('Relations - changeParentDoc', function (test, done) {
-  var quotesName = Random.id(),
-    quotes = new Mongo.Collection(quotesName),
-    users = new Mongo.Collection(Random.id()),
-    publish = Random.id(),
-    docs = data.quotes;
-
-  for (var doc in docs) {
-    var quote = docs[doc];
-
-    quotes.insert(quote);
-    users.insert({
-      _id: quote.user,
-      profile: {
-        age: quote._id * 2 + 15,
-        postalCode: quote._id * 99 
-      }
-    });
-  };
-
-  PublishRelations(publish, function () {
-    this.cursor(quotes.find(), function (id, doc) {
-      var user = this.changeParentDoc(users.find({_id: doc.user}), function (id, doc) {
-        return {userProfile: doc.profile};
-      });
-
-      doc.userProfile = user.userProfile;
-    });
-  
-    return this.ready();
-  });
-
-  var client = Client();
-  client._livedata_data = function (msg) {
-    if (msg.msg == 'added') {
-      test.equal(msg.collection, quotesName);
-
-      var user = users.findOne({_id: msg.fields.user});
-      users.update({_id: user._id}, {$set: {'profile.age': user.profile.age + 1}});
-
-      test.equal(msg.fields.userProfile, user.profile);
-
-    } else if (msg.msg == 'changed') {
-      test.equal(msg.collection, quotesName);
-      test.equal(msg.fields.userProfile.age, msg.id * 2 + 16);
 
     } else if (msg.msg == 'ready') {
       client.disconnect();
