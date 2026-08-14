@@ -213,6 +213,47 @@ return [];
 return [cursor1, cursor2, cursor3];
 ```
 
+## Limitations
+
+### One publication sending the same collection twice
+
+Everything a publication sends goes out under a single subscription handle, and
+Meteor tracks a published document per *handle*, not per publisher. So when a
+join and a cursor of the same publication both send documents of one collection,
+the first `removed` from either takes the document away from the client even
+though the other still matches it — and it comes back only when that other
+cursor next restarts.
+
+Keep the join's membership a superset of what the cursors publish and it cannot
+happen, because a retraction then only fires once nothing wants the document any
+more:
+
+```js
+// Rooms are sent twice here: by the join, and by the nested cursor.
+this.cursor(Meteor.users.find(), function (id, doc) {
+  if (doc.roomId) {
+    rooms.push(doc.roomId);                       // <- keeps the two in step
+    this.cursor(Rooms.find({_id: doc.roomId}), function (id, room) {
+      owners.push(room.ownerId);
+    });
+  }
+});
+```
+
+That is worth checking whenever a publication has both a join and a cursor on
+one collection: for every such cursor there should be a push into the matching
+join. Where that is not possible, either give one of them its own name
+(`this.cursor(cursor, 'roomsLookup', callbacks)`, which sends it to a separate
+client collection) or use `this.observe`, which runs callbacks without sending
+anything at all.
+
+In development the package warns when this bites — once per collection, when a
+cursor tries to update a document a join has already retracted. Two caveats:
+the warning reports the *consequence*, so a document that is retracted and then
+never changes again produces no warning at all; and it is gated on
+`Meteor.isDevelopment`, so a staging build running in production mode stays
+silent about it.
+
 ## Testing
 
 The suite has two layers. Run both with one command:
