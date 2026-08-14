@@ -1,29 +1,54 @@
-// CursorJoin in isolation: refcounting, the retraction queue and the deferred
-// restart. Everything here is about state the Tinytest layer cannot inspect -
-// what sits in the defer queue, and what happens when a release lands in the
-// same tick as a push.
+// CursorJoin in isolation: contribution bookkeeping, the reconcile diff and the
+// deferred restart. Everything here is about state the Tinytest layer cannot
+// inspect - what sits in the defer queue, and what happens when a contributor
+// is released in the same tick as a push.
 
 const { loadModules, makeMeteorStub, createReporter, makeSub, strategies } = require('./harness');
 
 module.exports = function run() {
   const { check, report } = createReporter('unit: CursorJoin');
 
-  // A join needs CursorMethods only as a prototype host, so stub it.
+  // A join needs CursorMethods only as a prototype host, so stub it. Contributors
+  // are real HandlerControllers, because that is what the join keys by and what
+  // drives release through stop().
   function build(subOptions) {
     const Meteor = makeMeteorStub();
-    const sandbox = loadModules(['cursor/published.js', 'cursor/contributor-context.js', 'cursor/join.js'], {
-      Meteor,
-      CursorMethods: class {},
-    });
+    const sandbox = loadModules(
+      ['cursor/published.js', 'cursor/contributor-context.js', 'handler_controller.js', 'cursor/join.js'],
+      { Meteor, CursorMethods: class {} }
+    );
     const { sub, events, isPublished } = makeSub(subOptions);
     const cursorCalls = [];
-    const methods = { sub, _registrySeq: 0, cursor: (...args) => cursorCalls.push(args) };
+    const seqs = Object.create(null);
+    const methods = {
+      sub,
+      cursor: (...args) => cursorCalls.push(args),
+      _nextRegistryKey: (name, kind) => {
+        const bucket = name + '#' + kind;
+        const seq = seqs[bucket] || 0;
+        seqs[bucket] = seq + 1;
+        return bucket + seq;
+      },
+    };
     const collection = { _name: 'authors', find: () => ({ _getCollectionName: () => 'authors' }) };
     const join = new sandbox.CursorJoin(methods, collection, {}, 'authors');
+
+    // Named contributors, so the tests read like the old string-keyed ones.
+    // owner('a') is a root controller; owner('a', 'b') is 'b' nested under it,
+    // which is exactly the tree cursor.js builds with handler.addBasic(id).
+    const roots = new Map();
+    const owner = (name, child) => {
+      if (!roots.has(name)) roots.set(name, new sandbox.HandlerController());
+      const root = roots.get(name);
+      return child === undefined ? root : root.addBasic(child);
+    };
     // Pushes ids as a given contributor, the way cursor.js frames each callback.
-    const pushAs = (contributorId, ...ids) =>
-      sandbox.runInContributor({ id: contributorId, parent: null }, () => join.push(...ids));
-    return { join, sub, events, isPublished, cursorCalls, pushAs, sandbox, Meteor, flush: Meteor._flush };
+    const pushAs = (name, ...ids) => sandbox.runInContributor(owner(name), () => join.push(...ids));
+    // A contributor's document leaves the result set: cursor.js stops its
+    // controller, which is what releases the contribution.
+    const stopOwner = (name, child) => owner(name, child).stop();
+
+    return { join, sub, events, isPublished, cursorCalls, pushAs, owner, stopOwner, sandbox, Meteor, flush: Meteor._flush };
   }
 
   // --- the retraction is deferred, and only touches published ids ----------
@@ -34,7 +59,7 @@ module.exports = function run() {
     t.join.send();
     t.cursorCalls.length = 0;
 
-    t.join.release('c1');
+    t.stopOwner('c1');
     check('retraction does not run inline', t.events.filter(e => e[0] === 'removed').length, 0);
 
     t.flush();
@@ -54,7 +79,7 @@ module.exports = function run() {
     t.pushAs('c1', objectLike);
     t.join.send();
 
-    t.join.release('c1');
+    t.stopOwner('c1');
     t.flush();
     check(
       'object-id-shaped id is matched',
@@ -70,9 +95,9 @@ module.exports = function run() {
     t.pushAs('c1', 'a1');
     t.join.send();
 
-    t.join.release('c1');
+    t.stopOwner('c1');
     t.pushAs('c2', 'a1');
-    t.join.release('c2');
+    t.stopOwner('c2');
     t.flush();
     check('duplicate release removes once', t.events.filter(e => e[0] === 'removed').length, 1);
   }
@@ -84,7 +109,7 @@ module.exports = function run() {
     t.pushAs('c1', 'a1');
     t.join.send();
 
-    t.join.release('c1');
+    t.stopOwner('c1');
     t.pushAs('c2', 'a1'); // another contributor picks it back up
     t.flush();
     check('re-joined id is not retracted', t.events.filter(e => e[0] === 'removed').length, 0);
@@ -97,7 +122,7 @@ module.exports = function run() {
     t.sub.added('authors', 'a1');
     t.pushAs('c1', 'a1');
     t.join.sent = true;
-    t.join.release('c1');
+    t.stopOwner('c1');
     t.cursorCalls.length = 0;
     t.sub._deactivated = true;
 
@@ -111,7 +136,7 @@ module.exports = function run() {
     const t = build({ strategy: strategies.NO_MERGE_NO_HISTORY });
     t.pushAs('c1', 'a1', 'a2');
     t.join.send();
-    t.join.release('c1');
+    t.stopOwner('c1');
     t.flush();
     check('no _documents proof -> no retraction', t.events.filter(e => e[0] === 'removed').length, 0);
   }
@@ -124,7 +149,7 @@ module.exports = function run() {
     delete t.sub._idFilter; // _idFilter gone -> identity fallback
     t.pushAs('c1', 'a1', 'a2');
     t.join.send();
-    t.join.release('c1');
+    t.stopOwner('c1');
     t.flush();
     check(
       'survives renamed internals',
@@ -143,28 +168,87 @@ module.exports = function run() {
     t.join.send();
     t.cursorCalls.length = 0;
 
-    t.join.release('c1');
-    t.join.release('c2');
-    t.join.release('c3');
+    t.stopOwner('c1');
+    t.stopOwner('c2');
+    t.stopOwner('c3');
     t.flush();
     check('three releases -> one restart', t.cursorCalls.length, 1);
     check('all three retracted', t.events.filter(e => e[0] === 'removed').length, 3);
   }
 
-  // --- the contributor frame is scoped, never a shared stack ---------------
+  // --- a new contributor for an id already held does not restart -----------
   {
     const t = build();
+    t.pushAs('c1', 'a1');
+    t.join.send();
+    t.cursorCalls.length = 0;
+
+    t.pushAs('c2', 'a1'); // same id, second contributor -> union is unchanged
+    t.flush();
+    check('unchanged membership -> no restart', t.cursorCalls.length, 0);
+    check('the contribution was still recorded', t.join.contributions.size, 2);
+
+    t.stopOwner('c1'); // ...and it is what keeps the id alive now
+    t.flush();
+    check('still no restart, the id is still held', t.cursorCalls.length, 0);
+    check('the id survives its first contributor', t.join.data, ['a1']);
+
+    t.stopOwner('c2');
+    t.flush();
+    check('the last contributor leaving does restart', t.cursorCalls.length, 1);
+    check('and empties the $in', t.join.data, []);
+  }
+
+  // --- a push from a callback that outlived its controller is dropped ------
+  {
+    const t = build();
+    t.pushAs('c1', 'a1');
+    t.join.send();
+    t.cursorCalls.length = 0;
+
+    const orphan = t.owner('c2');
+    orphan.stop(); // its document left the result set while its callback yielded
+    t.sandbox.runInContributor(orphan, () => t.join.push('a2'));
+    t.flush();
+
+    check('the orphaned push is not recorded', t.join.contributions.has(orphan), false);
+    check('and never reaches the $in', t.join.data, ['a1']);
+  }
+
+  // --- the contributor is scoped, never a shared stack ---------------------
+  {
+    const t = build();
+    const outer = t.owner('outer');
+    const nested = t.owner('outer', 'child');
     const seen = [];
-    t.sandbox.runInContributor({ id: 'outer', parent: null }, () => {
-      seen.push(t.sandbox.currentContributor().id);
-      t.sandbox.runInContributor({ id: 'inner', parent: 'outer' }, () => {
-        seen.push(t.sandbox.currentContributor().id);
-        seen.push(t.sandbox.currentContributor().parent);
+    t.sandbox.runInContributor(outer, () => {
+      seen.push(t.sandbox.currentContributor() === outer);
+      t.sandbox.runInContributor(nested, () => {
+        seen.push(t.sandbox.currentContributor() === nested);
       });
-      seen.push(t.sandbox.currentContributor().id); // inner must not linger
+      seen.push(t.sandbox.currentContributor() === outer); // nested must not linger
     });
     seen.push(t.sandbox.currentContributor()); // nothing leaks out
-    check('nested frames nest and restore', seen, ['outer', 'inner', 'outer', 'outer', null]);
+    check('nested contributors nest and restore', seen, [true, true, true, null]);
+  }
+
+  // --- stopping a parent releases its nested contributors too --------------
+  {
+    const t = build();
+    ['a1', 'a2'].forEach(id => t.sub.added('authors', id));
+    t.pushAs('parent', 'a1');
+    t.sandbox.runInContributor(t.owner('parent', 'nested'), () => t.join.push('a2'));
+    t.join.send();
+    check('both contributions are in the $in', t.join.data.slice().sort(), ['a1', 'a2']);
+
+    t.stopOwner('parent'); // the nested controller is a child, so stop() recurses
+    t.flush();
+    check('parent and nested ids both released', t.join.data, []);
+    check(
+      'both retracted',
+      t.events.filter(e => e[0] === 'removed').map(e => e[2]).sort(),
+      ['a1', 'a2']
+    );
   }
 
   // --- the deferred restart does not inherit the contributor that pushed ---
@@ -222,7 +306,7 @@ module.exports = function run() {
       throw new Error('transient mongo error');
     };
 
-    t.join.release('c1');
+    t.stopOwner('c1');
     t.flush();
     t.Meteor._flushTimers();
     check('the observe came back', t.cursorCalls.length, 1);
@@ -260,7 +344,9 @@ module.exports = function run() {
     const a = build();
     const b = build();
     a.pushAs('c1', 'a3', 'a1', 'a2');
+    a.join.send();
     b.pushAs('c1', 'a1', 'a2', 'a3');
+    b.join.send();
     check('same members, different push order -> same selector', a.join._selector(), b.join._selector());
   }
 
@@ -272,10 +358,13 @@ module.exports = function run() {
     warm.pushAs('c1', 'a1');
     warm.pushAs('c2', 'a2');
     warm.pushAs('c3', 'a3');
-    warm.join.release('c2'); // a2 leaves the middle of the array...
-    warm.pushAs('c4', 'a2'); // ...and comes back appended at the end
+    warm.join.send();
+    warm.stopOwner('c2'); // a2's contributor goes away...
+    warm.pushAs('c4', 'a2'); // ...and another picks it up, at the end of the union
+    warm.flush();
 
     fresh.pushAs('c1', 'a1', 'a2', 'a3');
+    fresh.join.send();
 
     check('a churned join matches a fresh one with the same members', warm.join._selector(), fresh.join._selector());
     check('and the underlying data really had drifted', warm.join.data, ['a1', 'a3', 'a2']);
@@ -286,6 +375,7 @@ module.exports = function run() {
     const t = build();
     t.join.selector = _ids => ({ postId: _ids });
     t.pushAs('c1', 'a3', 'a1');
+    t.join.send();
     check('custom selector receives sorted ids', t.join._selector(), { postId: { $in: ['a1', 'a3'] } });
   }
 

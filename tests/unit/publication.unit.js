@@ -276,5 +276,101 @@ module.exports = function run() {
     check('observeChanges() after stop creates nothing live', t.db.live('posts').length, 0);
   }
 
+  // === a changed callback only sees the changed fields =====================
+  // Pins down why contributions are still append-only: observeChanges hands the
+  // callback a delta, not the document, so a callback re-run cannot re-declare
+  // what it contributes. Clearing the contribution before it runs would release
+  // ids on every unrelated change (see design.md).
+  {
+    const t = build();
+    const posts = t.db.coll('posts');
+    const authors = t.db.coll('authors');
+    t.db.insert('authors', { _id: 'A1' });
+    t.db.insert('posts', { _id: 'post1', authorId: 'A1', title: 'a' });
+
+    const seen = [];
+    t.publish(function () {
+      const join = this.join(authors);
+      this.cursor(posts.find({}), function (id, doc, changed) {
+        seen.push([changed === true, doc.authorId]);
+        if (doc.authorId) join.push(doc.authorId);
+      });
+      join.send();
+    });
+    check('the linked doc is published', t.isPublished('authors', 'A1'), true);
+
+    t.db.update('posts', 'post1', { title: 'b' }); // unrelated field
+    t.flush();
+    check('the callback saw only the delta', seen, [[false, 'A1'], [true, undefined]]);
+    check('the unrelated change did not release the link', t.isPublished('authors', 'A1'), true);
+    check('and the $in still holds it', t.db.live('authors')[0].selector._id.$in, ['A1']);
+  }
+
+  // === rebuilding a nested cursor keeps what it contributed ================
+  // The common shape without an `if (!changed)` guard: the callback re-runs on
+  // every parent update and re-opens its nested cursor. It is handed the update,
+  // not the document, so the foreign key is usually undefined and the rebuilt
+  // cursor declares nothing - releasing on the swap would drop the joined doc
+  // from the client on any unrelated edit.
+  {
+    const t = build();
+    const posts = t.db.coll('posts');
+    const books = t.db.coll('books');
+    const authors = t.db.coll('authors');
+    t.db.insert('authors', { _id: 'A1' });
+    t.db.insert('books', { _id: 'B1', authorId: 'A1' });
+    t.db.insert('posts', { _id: 'post1', bookId: 'B1', title: 'a' });
+
+    t.publish(function () {
+      const join = this.join(authors);
+      this.cursor(posts.find({}), function (id, doc) {
+        this.cursor(books.find({ _id: doc.bookId }), function (bid, book) {
+          join.push(book.authorId);
+        });
+      });
+      join.send();
+    });
+    check('the joined doc is published', t.isPublished('authors', 'A1'), true);
+
+    t.db.update('posts', 'post1', { title: 'b' }); // does not touch bookId
+    t.flush();
+    check('an unrelated parent edit keeps it', t.isPublished('authors', 'A1'), true);
+    check('and the $in still holds it', t.db.live('authors')[0].selector._id.$in, ['A1']);
+
+    t.db.remove('posts', 'post1'); // the parent really leaves
+    t.flush();
+    check('the parent leaving does release it', t.isPublished('authors', 'A1'), false);
+    check('and empties the $in', t.db.live('authors')[0].selector._id.$in, []);
+  }
+
+  // === a skipped nested cursor must not shift the next one's key ===========
+  // The guarded form the README recommends - `if (doc.someId) this.cursor(...)`
+  // - means a callback creates a nested cursor only sometimes. Registry keys are
+  // counted per collection so the second cursor still supersedes its own
+  // observer rather than being handed the skipped one's slot.
+  {
+    const t = build();
+    const posts = t.db.coll('posts');
+    const books = t.db.coll('books');
+    const authors = t.db.coll('authors');
+    t.db.insert('books', { _id: 'B1' });
+    t.db.insert('authors', { _id: 'A1' });
+    t.db.insert('posts', { _id: 'post1', bookId: 'B1', authorId: 'A1' });
+
+    t.publish(function () {
+      this.cursor(posts.find({}), function (id, doc) {
+        if (doc.bookId) this.cursor(books.find({ _id: doc.bookId }));
+        if (doc.authorId) this.cursor(authors.find({ _id: doc.authorId }));
+      });
+    });
+    check('both nested cursors are live', [t.db.live('books').length, t.db.live('authors').length], [1, 1]);
+
+    // an update carrying only authorId: the books cursor is skipped this time
+    t.db.update('posts', 'post1', { authorId: 'A1' });
+    t.flush();
+    check('the skipped one keeps its observer', t.db.live('books').length, 1);
+    check('and the second superseded its own', t.db.live('authors').length, 1);
+  }
+
   return report();
 };
