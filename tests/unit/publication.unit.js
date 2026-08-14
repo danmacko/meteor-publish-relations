@@ -372,5 +372,45 @@ module.exports = function run() {
     check('and the second superseded its own', t.db.live('authors').length, 1);
   }
 
+  // === what an observe pushes belongs to whoever created it ================
+  // Meteor delivers an observe's initial adds through a bindEnvironment-wrapped
+  // task but every later event raw, so without an explicit binding the same
+  // callback would be tracked or pinned for good depending on when a document
+  // turned up. Here the second comment arrives after the observe was built.
+  {
+    const t = build();
+    const posts = t.db.coll('posts');
+    const comments = t.db.coll('comments');
+    const authors = t.db.coll('authors');
+    t.db.insert('authors', { _id: 'A1' });
+    t.db.insert('authors', { _id: 'A2' });
+    t.db.insert('posts', { _id: 'post1' });
+    t.db.insert('comments', { _id: 'c1', postId: 'post1', authorId: 'A1' });
+
+    t.publish(function () {
+      const join = this.join(authors);
+      this.cursor(posts.find({}), function (id) {
+        this.observeChanges(comments.find({ postId: id }), {
+          added(cid, comment) {
+            join.push(comment.authorId);
+          },
+          changed() {},
+          removed() {},
+        });
+      });
+      join.send();
+    });
+    check('the observe publishes nothing itself', t.isPublished('comments', 'c1'), false);
+    check('but its push reached the join', t.isPublished('authors', 'A1'), true);
+
+    t.db.insert('comments', { _id: 'c2', postId: 'post1', authorId: 'A2' }); // a later event
+    t.flush();
+    check('a later push reaches the join too', t.isPublished('authors', 'A2'), true);
+
+    t.db.remove('posts', 'post1'); // the contributor that created the observe leaves
+    t.flush();
+    check('both pushes are released with it', t.db.live('authors')[0].selector._id.$in, []);
+  }
+
   return report();
 };
