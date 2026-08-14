@@ -252,5 +252,42 @@ module.exports = function run() {
     check('gave up with an explicit log', t.Meteor._debugs.filter(d => d.indexOf('gave up restarting') !== -1).length, 1);
   }
 
+  // --- the {$in} is a function of membership, not of push order ------------
+  // Mongo keys its ObserveMultiplexer cache by the serialised cursor
+  // description, so two joins holding the same members must produce a byte-equal
+  // selector or they can never share an observer.
+  {
+    const a = build();
+    const b = build();
+    a.pushAs('c1', 'a3', 'a1', 'a2');
+    b.pushAs('c1', 'a1', 'a2', 'a3');
+    check('same members, different push order -> same selector', a.join._selector(), b.join._selector());
+  }
+
+  // --- and it survives churn, which is where the order actually drifts -----
+  {
+    const warm = build();
+    const fresh = build();
+
+    warm.pushAs('c1', 'a1');
+    warm.pushAs('c2', 'a2');
+    warm.pushAs('c3', 'a3');
+    warm.join.release('c2'); // a2 leaves the middle of the array...
+    warm.pushAs('c4', 'a2'); // ...and comes back appended at the end
+
+    fresh.pushAs('c1', 'a1', 'a2', 'a3');
+
+    check('a churned join matches a fresh one with the same members', warm.join._selector(), fresh.join._selector());
+    check('and the underlying data really had drifted', warm.join.data, ['a1', 'a3', 'a2']);
+  }
+
+  // --- a custom selector gets the sorted array too --------------------------
+  {
+    const t = build();
+    t.join.selector = _ids => ({ postId: _ids });
+    t.pushAs('c1', 'a3', 'a1');
+    check('custom selector receives sorted ids', t.join._selector(), { postId: { $in: ['a1', 'a3'] } });
+  }
+
   return report();
 };
