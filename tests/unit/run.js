@@ -7,24 +7,32 @@
 // The Tinytest suite in tests/ covers everything that needs a real server:
 //   meteor test-packages --release METEOR@2.15 ./
 
-const suites = [require('./join.unit'), require('./publication.unit')];
+const suites = [require('./join.unit'), require('./publication.unit'), require('./contributor.unit')];
 
-let failures = 0;
-let checks = 0;
+// A suite may be async (the contributor one suspends callbacks on purpose), so
+// this is a promise chain - and it needs its own .catch: an unhandled rejection
+// exits 0 on node 14, which would report a crashed run as a passing one.
+(async () => {
+  let failures = 0;
+  let checks = 0;
 
-for (const suite of suites) {
-  const result = suite();
-  failures += result.failures;
-  checks += result.checks;
-}
+  for (const suite of suites) {
+    const result = await suite();
+    failures += result.failures;
+    checks += result.checks;
+  }
 
-console.log(
-  '\n' +
-    checks +
-    ' checks, ' +
-    failures +
-    ' failed' +
-    (failures ? '' : '  -  run the Tinytest suite too: meteor test-packages ./')
-);
+  console.log(
+    '\n' +
+      checks +
+      ' checks, ' +
+      failures +
+      ' failed' +
+      (failures ? '' : '  -  run the Tinytest suite too: meteor test-packages ./')
+  );
 
-process.exit(failures ? 1 : 0);
+  process.exit(failures ? 1 : 0);
+})().catch(error => {
+  console.error('\nthe unit run itself failed:\n', error);
+  process.exit(1);
+});

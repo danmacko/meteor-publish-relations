@@ -8,10 +8,12 @@ const { loadModules, makeMeteorStub, createReporter, FakeDB, makeSub } = require
 
 const MODULES = [
   'cursor/published.js',
+  'cursor/contributor-context.js',
   'cursor/nonreactive/cursor.js',
   'handler_controller.js',
   'cursor/cursor.js',
   'cursor/utils.js',
+  'cursor/observe.js',
   'cursor/join.js',
 ];
 
@@ -171,6 +173,107 @@ module.exports = function run() {
     check('still-referenced doc untouched', t.isPublished('authors', 'A1'), true);
     check('exactly one removed sent', t.events.filter(e => e[0] === 'removed' && e[1] === 'authors').length, 1);
     check('observe restarted with the smaller $in', t.db.live('authors')[0].selector._id.$in, ['A1']);
+  }
+
+  // === contributions are keyed per cursor, not by bare doc _id =============
+  // Two collections whose docs share an _id both feed one join. Releasing by the
+  // bare _id would let either removal drop the other's contribution.
+  {
+    const t = build();
+    const posts = t.db.coll('posts');
+    const tasks = t.db.coll('tasks');
+    const authors = t.db.coll('authors');
+    t.db.insert('authors', { _id: 'A1' });
+    t.db.insert('posts', { _id: 'x1', authorId: 'A1' });
+    t.db.insert('tasks', { _id: 'x1', authorId: 'A1' });
+
+    t.publish(function () {
+      const join = this.join(authors);
+      this.cursor(posts.find({}), function (id, doc) {
+        join.push(doc.authorId);
+      });
+      this.cursor(tasks.find({}), function (id, doc) {
+        join.push(doc.authorId);
+      });
+      join.send();
+    });
+    check('joined doc published', t.isPublished('authors', 'A1'), true);
+
+    t.db.remove('posts', 'x1'); // the task sharing the _id still references A1
+    t.flush();
+    check('a same-_id sibling keeps the joined doc', t.isPublished('authors', 'A1'), true);
+    check('the $in still holds it', t.db.live('authors')[0].selector._id.$in, ['A1']);
+
+    t.db.remove('tasks', 'x1'); // now the last contributor is gone
+    t.flush();
+    check('the last contributor leaving retracts it', t.isPublished('authors', 'A1'), false);
+  }
+
+  // === two overlapping cursors on ONE collection see the same _id ==========
+  {
+    const t = build();
+    const posts = t.db.coll('posts');
+    const authors = t.db.coll('authors');
+    t.db.insert('authors', { _id: 'A1' });
+    t.db.insert('posts', { _id: 'p1', tag: 'a', flagged: true, authorId: 'A1' });
+
+    t.publish(function () {
+      const join = this.join(authors);
+      this.cursor(posts.find({ tag: 'a' }), function (id, doc) {
+        join.push(doc.authorId);
+      });
+      this.cursor(posts.find({ flagged: true }), function (id, doc) {
+        join.push(doc.authorId);
+      });
+      join.send();
+    });
+    check('joined doc published once', t.events.filter(e => e[0] === 'added' && e[2] === 'A1').length, 1);
+
+    t.db.update('posts', 'p1', { tag: 'b' }); // leaves the first cursor, stays in the second
+    t.flush();
+    check('the still-matching cursor keeps the join alive', t.db.live('authors')[0].selector._id.$in, ['A1']);
+  }
+
+  // === registrations landing after teardown stay inert =====================
+  {
+    const t = build();
+    const posts = t.db.coll('posts');
+    const comments = t.db.coll('comments');
+    t.db.insert('posts', { _id: 'p1' });
+    t.db.insert('comments', { _id: 'c1', postId: 'p1' });
+
+    let resume = null;
+    const root = t.publish(function () {
+      this.cursor(posts.find({}), function (id) {
+        // models a callback that yields (a findOne) before opening its nested cursor
+        resume = () => this.cursor(comments.find({ postId: id }));
+      });
+    });
+
+    root.stop();
+    check('teardown stopped the parent observer', t.db.live('posts').length, 0);
+
+    resume(); // the suspended callback resumes after teardown
+    check('a nested cursor opened after stop stays inert', t.db.live('comments').length, 0);
+  }
+
+  // === a top-level cursor opened after teardown stays inert ================
+  {
+    const t = build();
+    const posts = t.db.coll('posts');
+    t.db.insert('posts', { _id: 'p1' });
+
+    let cursors = null;
+    const root = t.publish(function () {
+      cursors = this;
+    });
+    root.stop();
+
+    cursors.cursor(posts.find({}));
+    check('cursor() after stop creates nothing live', t.db.live('posts').length, 0);
+
+    cursors.observeChanges(posts.find({}), { added() {}, changed() {}, removed() {} });
+    check('observeChanges() after stop creates nothing live', t.db.live('posts').length, 0);
   }
 
   return report();
