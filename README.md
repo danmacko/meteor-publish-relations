@@ -74,6 +74,33 @@ publishes a cursor, `collection` is not required
 > **Note:**
 > when a document changes (update) **doc** contains only the changes, not the whole document.
 
+That note cuts both ways, and the writing side is the easy one to miss. Editing
+a field that is *not* in the update adds it to the update, so the client is told
+that field changed — and whatever it already held is overwritten:
+
+```js
+this.cursor(Meteor.users.find(), function (id, doc, changed) {
+  // BUG: on any update that does not touch roomId, doc.roomId is undefined, so
+  // this puts 'lobby' into the update and the client loses the real roomId
+  doc.roomId = doc.roomId || 'lobby';
+});
+```
+
+Guard it on the add, or on the field really being part of the update:
+
+```js
+this.cursor(Meteor.users.find(), function (id, doc, changed) {
+  if (!changed || 'roomId' in doc)
+    doc.roomId = doc.roomId || 'lobby';
+});
+```
+
+`'roomId' in doc` also holds when the field was cleared — a removed field arrives
+in the update with the value `undefined` — so the default still applies then.
+
+Defaults like this are usually better applied where the data is read, since the
+publication has to describe a change and not a state.
+
 ### this.join (Collection, options, name)
 It allows you to collect a lot of _ids and then make a single query, only Collection is required.
 * **Collection** is the Mongo Collection to be used
