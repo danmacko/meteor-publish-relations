@@ -135,6 +135,19 @@ this.cursor(Books.find(), function (id, doc) {
 
 comments.send();
 ```
+
+> **Note:**
+> declare a join in the publication body, as above — never inside a callback.
+> `push()` belongs in callbacks, the join itself does not.
+
+A callback runs again every time its document changes, so a join created inside
+one is a new instance each time. Each of them registers on that document's
+handler and none of them is released until the document leaves the result set —
+at which point every stale instance restarts its own observe and retracts
+through it. Nothing leaks, but a document that has changed fifty times pays for
+fifty of them at once, and there is no way for the package to tell that the
+older ones are finished with.
+
 ### this.observe / this.observeChanges (cursor, callbacks)
 observe or observe changes in a cursor without sending anything to the client, callbacks are the same as those used by meteor
 
