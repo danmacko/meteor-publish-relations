@@ -4,8 +4,8 @@
    local `node_modules` (Meteor ships the package directory as-is)
 2. bump `version:` in `package.js`
 3. `./test.sh --full`
-4. `meteor publish` — irreversible, a published version cannot be removed.
-   Regenerates `.versions`
+4. `meteor publish --release METEOR@2.15` — irreversible, a published version
+   cannot be removed. Regenerates `.versions`.
 5. confirm it landed: `grep danmacko:publish-relations .versions`
 6. `git add package.js .versions && git commit -m "chore: release X.Y.Z"`
 7. `git tag -a vX.Y.Z -m vX.Y.Z && git push origin master --tags`
