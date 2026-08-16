@@ -294,7 +294,9 @@ module.exports = function run() {
   {
     const t = build();
     t.sub.added('authors', 'a1');
+    t.sub.added('authors', 'a2');
     t.pushAs('c1', 'a1');
+    t.pushAs('c2', 'a2'); // stays, so the join still has something to observe
     t.join.send();
     t.cursorCalls.length = 0;
 
@@ -334,6 +336,112 @@ module.exports = function run() {
     check('no observe was created', t.cursorCalls.length, 0);
     check('no retry left dangling', t.Meteor._pendingTimers(), 0);
     check('gave up with an explicit log', t.Meteor._debugs.filter(d => d.indexOf('gave up restarting') !== -1).length, 1);
+  }
+
+  // --- a push of nothing leaves nothing behind -----------------------------
+  // A changed callback is handed the update, not the document, so `push(doc.fk)`
+  // is usually push(undefined). Recording a contributor for that would leave an
+  // empty entry whose later removal schedules a reconcile that has nothing to
+  // do - and, with no observer up yet, builds one over an empty {$in}.
+  {
+    const t = build();
+    t.join.send(); // nothing collected, so no observer
+    check('send builds nothing for an empty join', t.cursorCalls.length, 0);
+
+    t.sandbox.runInContributor(t.owner('c1'), () => t.join.push(undefined));
+    check('a push of nothing records no contributor', t.join.contributions.size, 0);
+
+    t.stopOwner('c1');
+    t.flush();
+    check('and its contributor leaving builds nothing either', t.cursorCalls.length, 0);
+    check('the $in is still empty', t.join.data, []);
+  }
+
+  // --- a failure in send() is retried, not thrown at the subscription ------
+  {
+    const t = build();
+    t.pushAs('c1', 'a1');
+
+    let failed = false;
+    const realCursor = t.join.methods.cursor;
+    t.join.methods.cursor = (...args) => {
+      if (failed) return realCursor(...args);
+      failed = true;
+      throw new Error('transient mongo error');
+    };
+
+    t.join.send(); // must not propagate - that would nosub the whole publication
+    check('the first attempt failed', failed, true);
+    check('no observe yet', t.cursorCalls.length, 0);
+    check('but a retry is scheduled', t.Meteor._pendingTimers(), 1);
+
+    t.Meteor._flushTimers();
+    check('and it comes up on the retry', t.cursorCalls.length, 1);
+  }
+
+  // --- a reconcile superseded mid-flight writes nothing back ---------------
+  // _cursor() yields, so a push arriving during it schedules a second reconcile
+  // that runs to completion in its own fiber. The first then wakes up holding a
+  // handle set()'s latch has already discarded - and if it claims the observer
+  // is live, a retry the second one scheduled will take the unchanged-membership
+  // skip and the join never rebuilds. Reentrancy stands in for the fiber here.
+  {
+    const t = build();
+    t.pushAs('c1', 'a1');
+    t.join.send();
+    t.cursorCalls.length = 0;
+
+    const realCursor = t.join.methods.cursor;
+    let reentered = false;
+
+    t.join.methods.cursor = (...args) => {
+      if (!reentered) {
+        reentered = true;
+        t.pushAs('c2', 'a2'); // lands while this _cursor() is still "yielding"
+        t.join.methods.cursor = () => {
+          throw new Error('transient mongo error');
+        };
+        t.flush(); // the second reconcile runs, fails, and schedules a retry
+        t.join.methods.cursor = realCursor;
+      }
+      return realCursor(...args);
+    };
+
+    t.pushAs('c3', 'a3');
+    t.flush();
+
+    check('the superseded run claimed no observer', t.join._observerLive, false);
+    check('the retry it scheduled is still pending', t.Meteor._pendingTimers(), 1);
+
+    t.cursorCalls.length = 0;
+    t.Meteor._flushTimers();
+    check('and the retry does rebuild', t.cursorCalls.length, 1);
+    check('leaving a live observer behind', t.join._observerLive, true);
+  }
+
+  // --- a join that gave up rebuilds on the next change ---------------------
+  // The unchanged-membership skip has to key off "an observer is up", not off
+  // the retry counter - _retryRestart zeroes that when it gives up.
+  {
+    const t = build();
+    t.pushAs('c1', 'a1');
+    t.join.send();
+    t.cursorCalls.length = 0;
+    t.join.methods.cursor = () => {
+      throw new Error('mongo is down');
+    };
+
+    t.pushAs('c2', 'a2');
+    t.flush();
+    t.Meteor._flushTimers();
+    check('it gave up', t.Meteor._debugs.filter(d => d.indexOf('gave up restarting') !== -1).length, 1);
+
+    // Mongo comes back. The union does not change - a2 is already a member -
+    // but there is no observer, so this must NOT take the skip.
+    t.join.methods.cursor = (...args) => t.cursorCalls.push(args);
+    t.pushAs('c3', 'a2');
+    t.flush();
+    check('an observer-less join still rebuilds', t.cursorCalls.length, 1);
   }
 
   // --- the {$in} is a function of membership, not of push order ------------

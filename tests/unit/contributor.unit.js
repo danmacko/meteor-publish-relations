@@ -72,5 +72,6 @@ module.exports = async function run() {
   // --- outside any frame there is no contributor, and no throw -------------
   check('no frame -> null, not a throw', currentContributor(), null);
 
+
   return report();
 };

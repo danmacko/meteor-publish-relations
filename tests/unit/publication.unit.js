@@ -278,10 +278,13 @@ module.exports = function run() {
   }
 
   // === a changed callback only sees the changed fields =====================
-  // Pins down why contributions are still append-only: observeChanges hands the
-  // callback a delta, not the document, so a callback re-run cannot re-declare
-  // what it contributes. Clearing the contribution before it runs would release
-  // ids on every unrelated change (see design.md).
+  // Pins down why contributions are still append-only. Making a callback re-run
+  // REPLACE what it contributes - clearing its set before the call - would fix
+  // an id left pinned when a foreign key is re-pointed. It cannot be done while
+  // observeChanges hands the callback a delta rather than the document: on any
+  // update that does not touch the key the callback reads, it declares nothing
+  // and a valid link is released. That is the worse of the two, so the pin
+  // stays; unblocking it needs the callback to be handed the merged document.
   {
     const t = build();
     const posts = t.db.coll('posts');
@@ -411,6 +414,78 @@ module.exports = function run() {
     t.db.remove('posts', 'post1'); // the contributor that created the observe leaves
     t.flush();
     check('both pushes are released with it', t.db.live('authors')[0].selector._id.$in, []);
+  }
+
+  // === a push from a removed callback is scoped, not permanent =============
+  {
+    const t = build();
+    const posts = t.db.coll('posts');
+    const authors = t.db.coll('authors');
+    t.db.insert('authors', { _id: 'A1' });
+    t.db.insert('authors', { _id: 'A2' });
+    t.db.insert('posts', { _id: 'post1', authorId: 'A1' });
+
+    t.publish(function () {
+      const join = this.join(authors);
+      this.cursor(posts.find({}), {
+        added(id, doc) {
+          join.push(doc.authorId);
+        },
+        changed() {},
+        removed() {
+          join.push('A2'); // the one callback that used to run with no contributor
+        },
+      });
+      join.send();
+    });
+    check('the added push is published', t.isPublished('authors', 'A1'), true);
+
+    t.db.remove('posts', 'post1');
+    t.flush();
+    check('the removed push belongs to the document too', t.db.live('authors')[0].selector._id.$in, []);
+  }
+
+  // === every callback is framed the same way ===============================
+  // README promises the package's methods are available on `this` in a callback,
+  // and removed used to be the one invoked without them. A throwing callback
+  // must also not keep the document's controller alive: stopping it is what
+  // releases the contributions.
+  {
+    const t = build();
+    const posts = t.db.coll('posts');
+    const authors = t.db.coll('authors');
+    t.db.insert('authors', { _id: 'A1' });
+    t.db.insert('posts', { _id: 'post1', authorId: 'A1' });
+
+    const sawMethods = {};
+    t.publish(function () {
+      const join = this.join(authors);
+      this.cursor(posts.find({}), {
+        added(id, doc) {
+          sawMethods.added = typeof this.cursor === 'function';
+          join.push(doc.authorId);
+        },
+        changed() {},
+        removed() {
+          sawMethods.removed = typeof this.cursor === 'function';
+          throw new Error('a callback may throw');
+        },
+      });
+      join.send();
+    });
+    check('added gets the methods', sawMethods.added, true);
+
+    let threw = false;
+    try {
+      t.db.remove('posts', 'post1');
+    } catch (error) {
+      threw = true;
+    }
+    t.flush();
+
+    check('so does removed', sawMethods.removed, true);
+    check('the throw was not swallowed', threw, true);
+    check('but the contribution was released anyway', t.db.live('authors')[0].selector._id.$in, []);
   }
 
   // === joinNonreactive publishes once and observes nothing =================
