@@ -110,24 +110,25 @@ It allows you to collect a lot of _ids and then make a single query, only Collec
 After creating an instance of `this.join` you can do the following
 ```js
 const comments = this.join(Comments, {});
-// default query is {_id: _id} or {_id: {$in: _ids}}
+// default query is {_id: {$in: _ids}}
 // if you need to use another field use selector
 comments.selector = function (_ids) {
-  // _ids is {$in: _ids} or a single _id
+  // _ids is always {$in: [...]}, one element or many
   return {bookId: _ids};
 };
 // Adds a new id to the query
 comments.push(id);
 comments.push(id2, id3, id4);
-// Sends the query to the client, after sending the query each new push()
-// send a new query, you do not have to worry about reactivity or
-// performance with this method
+// Sends the query to the client. From then on a push that changes what the
+// join holds restarts its query - coalesced, so a burst of them costs one
+// restart, and a push of something already held costs nothing at all. You do
+// not have to worry about reactivity or performance with this method
 comments.send();
 ```
 Why use this and not `this.cursor`? because they are just 2 queries
 ```js
 const comments = this.join(Comments, {});
-comments.selector = _ids => {bookId: _ids};
+comments.selector = _ids => ({bookId: _ids});
 
 this.cursor(Books.find(), function (id, doc) {
   comments.push(id);
@@ -163,7 +164,9 @@ It has 2 differences with `this.cursor`
 Is exactly the same as `this.join` but non reactive
 
 ## Performance Notes
-* all methods returns an object with the stop() method
+* every method hands back something with a `stop()` on it, with one exception:
+  `join.send()` returns nothing when the join has collected no ids, because
+  there is no observer to stop until it has some
 * all cursors are stopped when the publication stop
 * when the parent cursor is stopped or a document with cursors is removed all related cursors are stopped
 * all cursors use basic observeChanges as meteor does by default, performance does not come down
@@ -206,7 +209,7 @@ but you will find that the publication is becoming increasingly slow, suppose yo
 The solution is to use `this.join` to join all the comments and send them in a single query, passing from 12 queries to 3 queries for mongo
 ```js
 const comments = this.join(Comments);
-comments.selector = _ids => {bookId: _ids};
+comments.selector = _ids => ({bookId: _ids});
 
 this.cursor(Authors.find(authorId), function (id, doc) {
   // We not have to worry about the books cursor because we only have one author
@@ -227,6 +230,111 @@ return [cursor1, cursor2, cursor3];
 ```
 
 ## Limitations
+
+### A re-pointed foreign key can keep the old joined document
+
+What a callback pushes is added to what that document already contributes; a
+re-run never replaces it. Whether a re-pointed foreign key therefore leaves the
+old joined document behind depends on where the `push` is:
+
+Both of these react to the same edit — `book.authorId` going from `A1` to `A2` —
+and only the position of the `push` differs:
+
+```js
+// (1) the callback that reads the key pushes
+this.cursor(Books.find(), function (id, doc) {
+  if (doc.authorId) authors.push(doc.authorId);
+});
+// -> the join holds A1 AND A2
+
+// (2) a cursor that the key rebuilds pushes
+this.cursor(Books.find(), function (id, doc) {
+  if (doc.authorId) this.cursor(Authors.find({_id: doc.authorId}), function (aid, author) {
+    countries.push(author.countryId);
+  });
+});
+// -> the join holds A2's country, and A1's is retracted
+```
+
+| where the `push` is | what happens on a re-pointed key |
+|---|---|
+| the callback that reads the key | the old value stays declared alongside the new one |
+| a nested cursor's callback, when the rebuilt cursor matches something | what the old nested document declared is released and retracted from the client |
+| a nested cursor's callback, when the rebuilt cursor matches nothing | kept, exactly as in the first row |
+
+(1) is a deliberate trade, not an oversight. Replacing on every re-run needs the
+callback to state everything the document contributes, and it cannot: a `changed`
+callback is handed the update, not the document, so on any update that does not
+touch `authorId` it would declare nothing and drop a valid link. Ending up with
+one document too many is the better failure, so that is the one the package
+takes. It costs an extra document on the client and one extra id in the `{$in}`,
+both bounded by how many times the contributing documents re-point a key while
+they are in the result set.
+
+(2) works because the rebuilt cursor re-declares for itself what it still holds,
+which is a statement (1) has no way to make. The joined documents it no longer
+declares are retracted, so this is the shape to reach for when a key really does
+churn — but only where a nested cursor makes sense in the first place. Replacing
+the join with a nested cursor on the joined collection is not the same move and
+does not help: stopping an observer sends no `removed`, so the old document stays
+on the client from there too.
+
+(3) is where the rebuilt cursor delivered nothing at all, and the package cannot
+tell "the selector was built from a key this update does not carry" from "the
+selector is right and nothing matches it". The first means it could not ask and
+the ids must be kept; the second means they should go. It keeps them, because a
+document too many beats a document missing — so a key re-pointed at something
+that does not exist behaves like (1).
+
+Client code normally reads joined documents by the foreign key it finds on the
+parent, so a superseded one is simply never looked up; where the collection
+itself is what gets rendered, filter it by the keys the parent documents hold.
+
+### Two guarded `this.cursor` calls on the same collection, in one callback
+
+Needs all four of these together, so most publications can stop reading here:
+
+* two or more `this.cursor` calls **on the same collection**
+* both inside the **same callback**
+* at least one of them **guarded** by an `if`
+* an update that reaches a later call while skipping an earlier one
+
+`this.join` is not affected at all, however many joins there are on a
+collection: a join takes its slot key once, when it is constructed in the
+publication body, and keeps it for the life of the subscription.
+
+A nested cursor, by contrast, is identified by its collection and by the order of
+the `this.cursor` calls in the callback - which is what lets a re-run replace its
+own observer. A guard breaks that ordering when two of them are on the same
+collection:
+
+```js
+this.cursor(Books.find(), function (id, doc) {
+  if (doc.mainAuthorId) this.cursor(Authors.find({_id: doc.mainAuthorId}));
+  if (doc.editorId) this.cursor(Authors.find({_id: doc.editorId}));   // same collection
+});
+```
+
+On an update carrying `editorId` but not `mainAuthorId` the first call is
+skipped, so the second is now the first `Authors` cursor of that run and is
+handed the first one's slot: it stops the main author's observer and leaves its
+own previous observer running in a slot it no longer claims.
+
+Nothing leaks on the server - the number of observers stays put - but the client
+does not recover on its own. Each such update leaves one more document sitting in
+the client's collection with no observer behind it: it will never change again and
+never be removed, and nothing about it says so. Meanwhile the editor the second
+cursor stopped claiming keeps its observer, so the client also keeps receiving
+updates for a document the publication no longer wants.
+
+Two cursors on one collection are fine unguarded, and any number of guarded
+cursors are fine on *different* collections. Only the combination bites. Send
+one of the two under its own name - `this.cursor(cursor, 'editors')` is a
+separate slot, and a separate collection on the client - or use the `added`
+form from Performance Notes, which does not re-run at all. Removing the guards
+is not a fix: the callback is handed the update, so the selector would be built
+from a key that is not in it, and the cursor would be replaced by one matching
+nothing.
 
 ### One publication sending the same collection twice
 
