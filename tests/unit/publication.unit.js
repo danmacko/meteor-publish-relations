@@ -41,6 +41,15 @@ module.exports = function run() {
     return { db, sub, events, isPublished, publish, warnings, flush: Meteor._flush };
   }
 
+  // The $in a join's live observer is currently built with, or null when it has
+  // none. Reading it off the observer directly turns "the join lost its
+  // observer" into a TypeError that takes the whole run down, instead of failing
+  // the one check that is wrong.
+  function joinedIds(t, collection) {
+    const observer = t.db.live(collection)[0];
+    return observer ? observer.selector._id.$in : null;
+  }
+
   // === one collection joined twice under different selectors ===============
   {
     const t = build();
@@ -173,7 +182,7 @@ module.exports = function run() {
     check('orphaned joined doc retracted', t.isPublished('authors', 'A2'), false);
     check('still-referenced doc untouched', t.isPublished('authors', 'A1'), true);
     check('exactly one removed sent', t.events.filter(e => e[0] === 'removed' && e[1] === 'authors').length, 1);
-    check('observe restarted with the smaller $in', t.db.live('authors')[0].selector._id.$in, ['A1']);
+    check('observe restarted with the smaller $in', joinedIds(t, 'authors'), ['A1']);
   }
 
   // === contributions are keyed per cursor, not by bare doc _id =============
@@ -203,7 +212,7 @@ module.exports = function run() {
     t.db.remove('posts', 'x1'); // the task sharing the _id still references A1
     t.flush();
     check('a same-_id sibling keeps the joined doc', t.isPublished('authors', 'A1'), true);
-    check('the $in still holds it', t.db.live('authors')[0].selector._id.$in, ['A1']);
+    check('the $in still holds it', joinedIds(t, 'authors'), ['A1']);
 
     t.db.remove('tasks', 'x1'); // now the last contributor is gone
     t.flush();
@@ -232,7 +241,7 @@ module.exports = function run() {
 
     t.db.update('posts', 'p1', { tag: 'b' }); // leaves the first cursor, stays in the second
     t.flush();
-    check('the still-matching cursor keeps the join alive', t.db.live('authors')[0].selector._id.$in, ['A1']);
+    check('the still-matching cursor keeps the join alive', joinedIds(t, 'authors'), ['A1']);
   }
 
   // === registrations landing after teardown stay inert =====================
@@ -307,7 +316,21 @@ module.exports = function run() {
     t.flush();
     check('the callback saw only the delta', seen, [[false, 'A1'], [true, undefined]]);
     check('the unrelated change did not release the link', t.isPublished('authors', 'A1'), true);
-    check('and the $in still holds it', t.db.live('authors')[0].selector._id.$in, ['A1']);
+    check('and the $in still holds it', joinedIds(t, 'authors'), ['A1']);
+
+    // The price of that, pinned: this update DOES carry the key, so the callback
+    // declares A2 - and nothing says A1 is no longer declared, because a re-run
+    // adds to what a callback contributes and never replaces it. The old id is
+    // held until the contributing document itself leaves.
+    t.db.insert('authors', { _id: 'A2' });
+    t.db.update('posts', 'post1', { authorId: 'A2' });
+    t.flush();
+    check('the new link is published', t.isPublished('authors', 'A2'), true);
+    check('and the old one is kept as well', joinedIds(t, 'authors'), ['A1', 'A2']);
+
+    t.db.remove('posts', 'post1'); // the contributor leaves: both go
+    t.flush();
+    check('the pin ends with the contributor', t.db.live('authors').length, 0);
   }
 
   // === rebuilding a nested cursor keeps what it contributed ================
@@ -339,12 +362,167 @@ module.exports = function run() {
     t.db.update('posts', 'post1', { title: 'b' }); // does not touch bookId
     t.flush();
     check('an unrelated parent edit keeps it', t.isPublished('authors', 'A1'), true);
-    check('and the $in still holds it', t.db.live('authors')[0].selector._id.$in, ['A1']);
+    check('and the $in still holds it', joinedIds(t, 'authors'), ['A1']);
 
     t.db.remove('posts', 'post1'); // the parent really leaves
     t.flush();
     check('the parent leaving does release it', t.isPublished('authors', 'A1'), false);
-    check('and empties the $in', t.db.live('authors')[0].selector._id.$in, []);
+    check('and an empty membership keeps no observer', t.db.live('authors').length, 0);
+  }
+
+  // === a rebuilt cursor that CAN re-declare gives the carry back ===========
+  // The other half of the shape above. When the rebuilt cursor does match its
+  // documents again they speak for themselves, through their own controllers,
+  // and what was carried across the swap has to go: it sits on the cursor's
+  // slot, which only dies with the parent document, so keeping it would outlive
+  // every child it came from - one nested document leaving would then release
+  // its own contribution while the carried copy held the id anyway.
+  {
+    const t = build();
+    const posts = t.db.coll('posts');
+    const books = t.db.coll('books');
+    const authors = t.db.coll('authors');
+    t.db.insert('authors', { _id: 'A1' });
+    t.db.insert('authors', { _id: 'A2' });
+    t.db.insert('books', { _id: 'B1', postId: 'post1', authorId: 'A1' });
+    t.db.insert('books', { _id: 'B2', postId: 'post1', authorId: 'A2' });
+    t.db.insert('posts', { _id: 'post1', title: 'a' });
+
+    t.publish(function () {
+      const join = this.join(authors);
+      this.cursor(posts.find({}), function (id, doc) {
+        // built from the parent _id, so the rebuild matches its books again
+        this.cursor(books.find({ postId: id }), function (bid, book) {
+          if (book.authorId) join.push(book.authorId);
+        });
+      });
+      join.send();
+    });
+    check('both authors joined', joinedIds(t, 'authors'), ['A1', 'A2']);
+
+    t.db.update('posts', 'post1', { title: 'b' }); // rebuilds the nested cursor
+    t.flush();
+    check('the rebuild holds them both', joinedIds(t, 'authors'), ['A1', 'A2']);
+
+    t.db.remove('books', 'B2'); // one nested doc leaves, the parent stays
+    t.flush();
+    check('and one child leaving releases exactly its own', joinedIds(t, 'authors'), ['A1']);
+    check('the orphan is retracted', t.isPublished('authors', 'A2'), false);
+  }
+
+  // === a re-pointed key, the three cases the README names =================
+  // Same edit each time - book.authorId going from one author to another - and
+  // only the position of the push differs. The join is on a third collection so
+  // that what is released is unambiguous: it is what the OLD nested document
+  // declared, not the key that was re-pointed.
+  {
+    const t = build();
+    const books = t.db.coll('books');
+    const authors = t.db.coll('authors');
+    const countries = t.db.coll('countries');
+    t.db.insert('countries', { _id: 'C1' });
+    t.db.insert('countries', { _id: 'C2' });
+    t.db.insert('authors', { _id: 'A1', countryId: 'C1' });
+    t.db.insert('authors', { _id: 'A2', countryId: 'C2' });
+    t.db.insert('books', { _id: 'B1', authorId: 'A1' });
+
+    t.publish(function () {
+      const join = this.join(countries);
+      this.cursor(books.find({}), function (id, doc) {
+        if (doc.authorId) {
+          this.cursor(authors.find({ _id: doc.authorId }), function (aid, author) {
+            if (author.countryId) join.push(author.countryId);
+          });
+        }
+      });
+      join.send();
+    });
+    const joined = () => {
+      const observer = t.db.live('countries')[0];
+      return observer ? observer.selector._id.$in : null;
+    };
+    check('the first author country is joined', joined(), ['C1']);
+
+    // (2) the rebuilt cursor matches A2, so it re-declares for itself and what
+    // A1 declared goes - off the client too, not only out of the {$in}.
+    t.db.update('books', 'B1', { authorId: 'A2' });
+    t.flush();
+    check('re-pointing releases what the old author declared', joined(), ['C2']);
+    check('and retracts it from the client', t.isPublished('countries', 'C1'), false);
+    check('while the new one is published', t.isPublished('countries', 'C2'), true);
+
+    // (3) the key is present and the selector is valid, but nothing matches it.
+    // Indistinguishable from "the update did not carry the key", so it is kept.
+    t.db.update('books', 'B1', { authorId: 'A404' });
+    t.flush();
+    check('re-pointing at nothing keeps the old declaration', joined(), ['C2']);
+    check('and leaves it on the client', t.isPublished('countries', 'C2'), true);
+  }
+
+  // === the carry is no substitute for guarding a nested cursor =============
+  // Where the two blocks above end. Carrying contributions across a rebuild
+  // keeps the JOIN whole; it does nothing for the rebuilt cursor itself, which
+  // is left observing a selector built from a key the update did not carry. Its
+  // documents stay on the client - stopping an observer sends no removed - and
+  // stop being reactive. Guarding the nested cursor is still the only fix.
+  {
+    const t = build();
+    const posts = t.db.coll('posts');
+    const books = t.db.coll('books');
+    const authors = t.db.coll('authors');
+    t.db.insert('authors', { _id: 'A1' });
+    t.db.insert('books', { _id: 'B1', authorId: 'A1', title: 'orig' });
+    t.db.insert('posts', { _id: 'post1', bookId: 'B1', note: 'a' });
+
+    t.publish(function () {
+      const join = this.join(authors);
+      this.cursor(posts.find({}), function (id, doc) {
+        // deliberately unguarded - the shape the README warns about
+        this.cursor(books.find({ _id: doc.bookId }), function (bid, book) {
+          if (book.authorId) join.push(book.authorId);
+        });
+      });
+      join.send();
+    });
+
+    t.db.update('posts', 'post1', { note: 'b' }); // rebuilds on {_id: undefined}
+    t.flush();
+    check('the join keeps its member', joinedIds(t, 'authors'), ['A1']);
+    check('and the book is still on the client', t.isPublished('books', 'B1'), true);
+
+    const before = t.events.length;
+    t.db.update('books', 'B1', { title: 'edited' });
+    check('but nothing observes it any more', t.events.length > before, false);
+  }
+
+  // === two guarded cursors on ONE collection share a counter ===============
+  // Known limitation, pinned so a change to it is deliberate. Registry keys are
+  // positional per collection, so when a changed callback skips the first guard
+  // the second call is handed the first's slot: it stops that cursor's observer
+  // and puts its own there, while its own previous observer keeps running in the
+  // slot it no longer claims. The document behind the stopped observer stays on
+  // the client with nothing watching it.
+  {
+    const t = build();
+    const posts = t.db.coll('posts');
+    const books = t.db.coll('books');
+    t.db.insert('books', { _id: 'B1' });
+    t.db.insert('books', { _id: 'B2' });
+    t.db.insert('books', { _id: 'B3' });
+    t.db.insert('posts', { _id: 'post1', bookId: 'B1', otherBookId: 'B2' });
+
+    t.publish(function () {
+      this.cursor(posts.find({}), function (id, doc) {
+        if (doc.bookId) this.cursor(books.find({ _id: doc.bookId }));
+        if (doc.otherBookId) this.cursor(books.find({ _id: doc.otherBookId }));
+      });
+    });
+    check('one observer per guarded cursor', t.db.live('books').map(o => o.selector._id), ['B1', 'B2']);
+
+    t.db.update('posts', 'post1', { otherBookId: 'B3' }); // the delta skips the first guard
+    t.flush();
+    check('the second cursor took the first ones slot', t.db.live('books').map(o => o.selector._id), ['B2', 'B3']);
+    check('leaving B1 published with nothing observing it', t.isPublished('books', 'B1'), true);
   }
 
   // === a skipped nested cursor must not shift the next one's key ===========
@@ -413,7 +591,8 @@ module.exports = function run() {
 
     t.db.remove('posts', 'post1'); // the contributor that created the observe leaves
     t.flush();
-    check('both pushes are released with it', t.db.live('authors')[0].selector._id.$in, []);
+    check('both pushes are released with it', [t.isPublished('authors', 'A1'), t.isPublished('authors', 'A2')], [false, false]);
+    check('and nothing is left to observe', t.db.live('authors').length, 0);
   }
 
   // === a push from a removed callback is scoped, not permanent =============
@@ -442,7 +621,8 @@ module.exports = function run() {
 
     t.db.remove('posts', 'post1');
     t.flush();
-    check('the removed push belongs to the document too', t.db.live('authors')[0].selector._id.$in, []);
+    check('the removed push belongs to the document too', [t.isPublished('authors', 'A1'), t.isPublished('authors', 'A2')], [false, false]);
+    check('leaving nothing to observe', t.db.live('authors').length, 0);
   }
 
   // === every callback is framed the same way ===============================
@@ -485,7 +665,7 @@ module.exports = function run() {
 
     check('so does removed', sawMethods.removed, true);
     check('the throw was not swallowed', threw, true);
-    check('but the contribution was released anyway', t.db.live('authors')[0].selector._id.$in, []);
+    check('but the contribution was released anyway', [t.isPublished('authors', 'A1'), t.db.live('authors').length], [false, 0]);
   }
 
   // === joinNonreactive publishes once and observes nothing =================
@@ -522,6 +702,37 @@ module.exports = function run() {
     // ...and a copy of it: this.data keeps growing, the handed array must not.
     join.push('A3');
     check('the handed array is a copy', handed[0], ['A1']);
+  }
+
+  // === _id belongs to the message, not to the fields =======================
+  // observeChanges strips _id from the fields it hands over and a plain find
+  // does not, so the reactive callback never sees one and the nonreactive one
+  // always does. That asymmetry is fine - one is a document, the other is an
+  // update - but it must not reach the wire: DDP carries the id separately, and
+  // the merge box drops an _id found in fields ("Publish API ignores _id if
+  // present in fields", SessionDocumentView.changeField), so sending it is
+  // wasted at best and a silent difference between the two paths at worst.
+  {
+    const t = build();
+    const books = t.db.coll('books');
+    t.db.insert('books', { _id: 'B1', title: 'orig' });
+
+    const seen = {};
+    t.publish(function () {
+      this.cursor(books.find({}), 'reactive', function (id, doc) {
+        seen.reactive = doc;
+      });
+      this.cursorNonreactive(books.find({}), 'nonreactive', function (id, doc) {
+        seen.nonreactive = doc;
+      });
+    });
+
+    check('the reactive callback is handed an update, without _id', seen.reactive, { title: 'orig' });
+    check('the nonreactive one is handed the whole document', seen.nonreactive, { _id: 'B1', title: 'orig' });
+
+    const fieldsFor = name => (t.events.find(e => e[0] === 'added' && e[1] === name) || [])[3];
+    check('neither puts _id in the fields it sends', ['_id' in fieldsFor('reactive'), '_id' in fieldsFor('nonreactive')], [false, false]);
+    check('and both send the fields themselves', [fieldsFor('reactive'), fieldsFor('nonreactive')], [{ title: 'orig' }, { title: 'orig' }]);
   }
 
   return report();

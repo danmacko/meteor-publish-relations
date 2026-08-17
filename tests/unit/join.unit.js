@@ -19,10 +19,25 @@ module.exports = function run() {
     );
     const { sub, events, isPublished } = makeSub(subOptions);
     const cursorCalls = [];
+    const observes = [];
     const seqs = Object.create(null);
+    const handler = new sandbox.HandlerController();
     const methods = {
       sub,
-      cursor: (...args) => cursorCalls.push(args),
+      handler,
+      // Enough of CursorMethods.cursor for the join: it registers a slot under
+      // the join's registry key and fills it, so the join's own release path
+      // (handler.remove) has something to find and stop.
+      cursor: (...args) => {
+        cursorCalls.push(args);
+        const slot = handler.add({ _cursorDescription: { collectionName: 'authors' } }, {
+          collection: 'authors',
+          key: args[3],
+        });
+        const observe = { stopped: false, stop() { this.stopped = true; } };
+        observes.push(observe);
+        return slot.set(observe);
+      },
       _nextRegistryKey: (name, kind) => {
         const bucket = name + '#' + kind;
         const seq = seqs[bucket] || 0;
@@ -48,7 +63,9 @@ module.exports = function run() {
     // controller, which is what releases the contribution.
     const stopOwner = (name, child) => owner(name, child).stop();
 
-    return { join, sub, events, isPublished, cursorCalls, pushAs, owner, stopOwner, sandbox, Meteor, flush: Meteor._flush };
+    const liveObserves = () => observes.filter(o => !o.stopped).length;
+
+    return { join, sub, events, isPublished, cursorCalls, liveObserves, pushAs, owner, stopOwner, sandbox, Meteor, flush: Meteor._flush };
   }
 
   // --- the retraction is deferred, and only touches published ids ----------
@@ -68,7 +85,9 @@ module.exports = function run() {
       t.events.filter(e => e[0] === 'removed').map(e => e[2]),
       ['a1']
     );
-    check('restarts the observe once', t.cursorCalls.length, 1);
+    // Nothing is left to join, so the slot is released rather than rebuilt over
+    // an empty {$in} - see the reconcile.
+    check('and stops the observe rather than rebuilding it', [t.cursorCalls.length, t.liveObserves()], [0, 0]);
   }
 
   // --- ids are compared in their stringified form --------------------------
@@ -165,6 +184,7 @@ module.exports = function run() {
     t.pushAs('c1', 'a1');
     t.pushAs('c2', 'a2');
     t.pushAs('c3', 'a3');
+    t.pushAs('c4', 'a4'); // stays, so this is a restart and not the empty case
     t.join.send();
     t.cursorCalls.length = 0;
 
@@ -195,8 +215,14 @@ module.exports = function run() {
 
     t.stopOwner('c2');
     t.flush();
-    check('the last contributor leaving does restart', t.cursorCalls.length, 1);
-    check('and empties the $in', t.join.data, []);
+    check('the last contributor leaving empties the $in', t.join.data, []);
+    // An observe over {$in: []} can never match and still costs a multiplexer
+    // (and an oplog trigger), so the slot goes instead.
+    check('and the observe goes with it', [t.cursorCalls.length, t.liveObserves()], [0, 0]);
+
+    t.pushAs('c3', 'a9'); // the join is not dead, only idle
+    t.flush();
+    check('a later push builds a fresh observe', [t.cursorCalls.length, t.liveObserves()], [1, 1]);
   }
 
   // --- a push from a callback that outlived its controller is dropped ------

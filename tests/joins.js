@@ -383,6 +383,59 @@ Tinytest.addAsync('Join - repeated restarts do not leak observers', function (te
   client.subscribe(publish);
 });
 
+Tinytest.addAsync('Join - two subscriptions holding the same ids share one observer', function (test, done) {
+  // Mongo caches an ObserveMultiplexer per EJSON.stringify of the cursor
+  // description, so the ORDER of the {$in} is part of the key. Two subscriptions
+  // that arrived at the same members in a different order would each get their
+  // own observer - one initial query and one oplog matcher per subscriber, for
+  // a query they could have shared. The join sorts the $in so the key depends on
+  // the membership alone; this asserts that, by pushing the same ids in
+  // opposite orders and counting what Mongo ends up holding.
+  const authorsName = Random.id();
+  const authors = new Mongo.Collection(authorsName);
+  const publish = Random.id();
+
+  ['a1', 'a2', 'a3'].forEach(id => authors.insert({ _id: id, name: id }));
+
+  PublishRelations(publish, function (reversed) {
+    const join = this.join(authors);
+    const ids = reversed ? ['a3', 'a2', 'a1'] : ['a1', 'a2', 'a3'];
+    ids.forEach(id => join.push(id));
+    join.send();
+
+    return this.ready();
+  });
+
+  const first = Client();
+  const second = Client();
+  const cancel = deadline(test, done, 'both subscriptions ready', 20000);
+  let ready = 0;
+
+  const onReady = () => {
+    if (++ready < 2) return;
+    cancel();
+
+    settle(() => {
+      test.equal(liveObservers(authorsName), 1, 'same members, different push order -> one shared observer');
+      first.disconnect();
+      settle(() => {
+        test.equal(liveObservers(authorsName), 1, 'one subscriber leaving does not stop the other');
+        second.disconnect();
+        settle(() => {
+          test.equal(liveObservers(authorsName), 0, 'and the last one out stops it');
+          done();
+        });
+      });
+    });
+  };
+
+  first._livedata_data = msg => { if (msg.msg === 'ready') onReady(); };
+  second._livedata_data = msg => { if (msg.msg === 'ready') onReady(); };
+
+  first.subscribe(publish, false);
+  second.subscribe(publish, true);
+});
+
 Tinytest.addAsync('Nested cursor - re-runs do not leak observers', function (test, done) {
   // A parent 'changed' re-runs its callback with a FRESH CursorMethods, so the
   // nested cursor's registry key must come out identical each time - otherwise

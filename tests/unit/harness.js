@@ -133,10 +133,15 @@ function createReporter(suiteName) {
   let checks = 0;
   const lines = [];
 
+  // JSON.stringify writes undefined inside an array as null, which would make
+  // [true, undefined] and [true, null] the same assertion - and telling those
+  // two apart is most of what the delta tests are for.
+  const show = value => JSON.stringify(value, (key, val) => (val === undefined ? '<undefined>' : val));
+
   function check(label, actual, expected) {
     checks++;
-    const a = JSON.stringify(actual);
-    const e = JSON.stringify(expected);
+    const a = show(actual);
+    const e = show(expected);
     if (a === e) {
       lines.push('  ok    ' + label + '  ' + a);
     } else {
@@ -167,6 +172,16 @@ function matches(doc, selector) {
     return doc[key] === cond;
   });
 }
+
+// observeChanges never puts _id in fields - diff-sequence deletes it and
+// ObserveMultiplexer._sendAdds destructures it out - so neither does this. It is
+// the difference between the reactive path and a plain find (which is what the
+// nonreactive API runs on and does hand over the whole document), and modelling
+// the two the same way would hide it.
+const fieldsOf = doc => {
+  const { _id, ...fields } = doc;
+  return fields;
+};
 
 class FakeDB {
   constructor() {
@@ -205,7 +220,7 @@ class FakeDB {
         db.colls[name].forEach((doc, id) => {
           if (matches(doc, selector)) {
             observer.ids.add(id);
-            callbacks.added(id, Object.assign({}, doc));
+            callbacks.added(id, fieldsOf(doc));
           }
         });
         return observer;
@@ -218,7 +233,7 @@ class FakeDB {
     this.observers.slice().forEach(o => {
       if (o.coll === name && matches(doc, o.selector)) {
         o.ids.add(doc._id);
-        o.callbacks.added(doc._id, Object.assign({}, doc));
+        o.callbacks.added(doc._id, fieldsOf(doc));
       }
     });
   }
@@ -231,7 +246,7 @@ class FakeDB {
       if (now && had) o.callbacks.changed(id, fields);
       else if (now && !had) {
         o.ids.add(id);
-        o.callbacks.added(id, Object.assign({}, doc));
+        o.callbacks.added(id, fieldsOf(doc));
       } else if (!now && had) {
         o.ids.delete(id);
         o.callbacks.removed(id);
@@ -272,23 +287,25 @@ function makeSub(options = {}) {
     _isDeactivated() {
       return this._deactivated;
     },
-    added(coll, id) {
+    // The fields object is recorded as a fourth element, so a test can assert
+    // on what would go out as the DDP payload and not only on the message order.
+    added(coll, id, fields) {
       let set = this._documents.get(coll);
       if (!set) this._documents.set(coll, (set = new Set()));
       const key = idStringify(id);
       if (set.has(key)) {
-        events.push(['changed', coll, id]);
+        events.push(['changed', coll, id, fields]);
         return;
       }
       set.add(key);
-      events.push(['added', coll, id]);
+      events.push(['added', coll, id, fields]);
     },
-    changed(coll, id) {
+    changed(coll, id, fields) {
       const set = this._documents.get(coll);
       if (strategy.useCollectionView && (!set || !set.has(idStringify(id)))) {
         throw new Error('Could not find element with id ' + id + ' to change');
       }
-      events.push(['changed', coll, id]);
+      events.push(['changed', coll, id, fields]);
     },
     removed(coll, id) {
       const set = this._documents.get(coll);
