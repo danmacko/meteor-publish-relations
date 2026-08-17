@@ -1,7 +1,7 @@
 Package.describe({
   name: 'danmacko:publish-relations',
   summary: 'Reactive joins for Meteor publications (fork of cottz:publish-relations)',
-  version: '3.2.0',
+  version: '3.2.1',
   git: 'https://github.com/danmacko/meteor-publish-relations',
   documentation: 'README.md'
 });
