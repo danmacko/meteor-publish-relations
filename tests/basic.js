@@ -30,7 +30,7 @@ Tinytest.addAsync('Cursor', function (test, done) {
   };
 
   PublishRelations(publish, function () {
-    this.cursor(quotes.find());
+    this.relations.cursor(quotes.find());
   
     return this.ready();
   });
@@ -59,7 +59,7 @@ Tinytest.addAsync('Observes', function (test, done) {
   }
 
   PublishRelations(publish, function () {
-    this.observe(quotes.find(), {
+    this.relations.observe(quotes.find(), {
       added: function (doc) {
         test.equal(doc, quotes.findOne(doc._id));
       }
@@ -67,7 +67,7 @@ Tinytest.addAsync('Observes', function (test, done) {
   });
 
   PublishRelations(publish2, function () {
-    this.observeChanges(quotes.find(), {
+    this.relations.observeChanges(quotes.find(), {
       added: function (id, doc) {
         test.equal(doc, quotes.findOne(id, {fields: {_id: 0}}));
       }

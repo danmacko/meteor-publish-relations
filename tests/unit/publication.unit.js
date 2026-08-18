@@ -31,10 +31,12 @@ module.exports = function run() {
     const db = new FakeDB();
     const { sub, events, isPublished } = makeSub();
 
+    // Mirrors publish_relations.js: the body runs with the subscription as
+    // `this` and the package API in its own namespace on this.relations.
     function publish(fn) {
       const root = new sandbox.HandlerController();
-      const cursors = new sandbox.CursorMethods(sub, root);
-      fn.apply(cursors);
+      sub.relations = new sandbox.CursorMethods(sub, root);
+      fn.apply(sub);
       return root;
     }
 
@@ -61,11 +63,11 @@ module.exports = function run() {
     t.db.insert('authors', { _id: 'A2', postId: 'post2', pseudonym: 'none' }); // first join only
 
     t.publish(function () {
-      const byPost = this.join(authors);
+      const byPost = this.relations.join(authors);
       byPost.selector = _ids => ({ postId: _ids });
-      const byPseudonym = this.join(authors);
+      const byPseudonym = this.relations.join(authors);
       byPseudonym.selector = _ids => ({ pseudonym: _ids });
-      this.cursor(posts.find({}), function (id, doc) {
+      this.relations.cursor(posts.find({}), function (id, doc) {
         byPost.push(id);
         byPseudonym.push(doc.pseudonym);
       });
@@ -108,11 +110,11 @@ module.exports = function run() {
     t.db.insert('authors', { _id: 'A1', postId: 'post1', pseudonym: 'ghost' }); // both joins
 
     t.publish(function () {
-      const byPost = this.join(authors);
+      const byPost = this.relations.join(authors);
       byPost.selector = _ids => ({ postId: _ids });
-      const byPseudonym = this.join(authors);
+      const byPseudonym = this.relations.join(authors);
       byPseudonym.selector = _ids => ({ pseudonym: _ids });
-      this.cursor(posts.find({}), function (id, doc) {
+      this.relations.cursor(posts.find({}), function (id, doc) {
         byPost.push(id);
         byPseudonym.push(doc.pseudonym);
       });
@@ -144,8 +146,8 @@ module.exports = function run() {
     t.db.insert('posts', { _id: 'b1', tag: 'b' });
 
     const root = t.publish(function () {
-      this.cursor(posts.find({ tag: 'a' }));
-      this.cursor(posts.find({ tag: 'b' }));
+      this.relations.cursor(posts.find({ tag: 'a' }));
+      this.relations.cursor(posts.find({ tag: 'b' }));
     });
 
     check('both cursors are live', t.db.live('posts').length, 2);
@@ -169,8 +171,8 @@ module.exports = function run() {
     t.db.insert('posts', { _id: 'post2', authorId: 'A2' });
 
     t.publish(function () {
-      const join = this.join(authors);
-      this.cursor(posts.find({}), function (id, doc) {
+      const join = this.relations.join(authors);
+      this.relations.cursor(posts.find({}), function (id, doc) {
         join.push(doc.authorId);
       });
       join.send();
@@ -198,11 +200,11 @@ module.exports = function run() {
     t.db.insert('tasks', { _id: 'x1', authorId: 'A1' });
 
     t.publish(function () {
-      const join = this.join(authors);
-      this.cursor(posts.find({}), function (id, doc) {
+      const join = this.relations.join(authors);
+      this.relations.cursor(posts.find({}), function (id, doc) {
         join.push(doc.authorId);
       });
-      this.cursor(tasks.find({}), function (id, doc) {
+      this.relations.cursor(tasks.find({}), function (id, doc) {
         join.push(doc.authorId);
       });
       join.send();
@@ -228,11 +230,11 @@ module.exports = function run() {
     t.db.insert('posts', { _id: 'p1', tag: 'a', flagged: true, authorId: 'A1' });
 
     t.publish(function () {
-      const join = this.join(authors);
-      this.cursor(posts.find({ tag: 'a' }), function (id, doc) {
+      const join = this.relations.join(authors);
+      this.relations.cursor(posts.find({ tag: 'a' }), function (id, doc) {
         join.push(doc.authorId);
       });
-      this.cursor(posts.find({ flagged: true }), function (id, doc) {
+      this.relations.cursor(posts.find({ flagged: true }), function (id, doc) {
         join.push(doc.authorId);
       });
       join.send();
@@ -254,9 +256,9 @@ module.exports = function run() {
 
     let resume = null;
     const root = t.publish(function () {
-      this.cursor(posts.find({}), function (id) {
+      this.relations.cursor(posts.find({}), function (id) {
         // models a callback that yields (a findOne) before opening its nested cursor
-        resume = () => this.cursor(comments.find({ postId: id }));
+        resume = () => this.relations.cursor(comments.find({ postId: id }));
       });
     });
 
@@ -273,16 +275,16 @@ module.exports = function run() {
     const posts = t.db.coll('posts');
     t.db.insert('posts', { _id: 'p1' });
 
-    let cursors = null;
+    let relations = null;
     const root = t.publish(function () {
-      cursors = this;
+      relations = this.relations;
     });
     root.stop();
 
-    cursors.cursor(posts.find({}));
+    relations.cursor(posts.find({}));
     check('cursor() after stop creates nothing live', t.db.live('posts').length, 0);
 
-    cursors.observeChanges(posts.find({}), { added() {}, changed() {}, removed() {} });
+    relations.observeChanges(posts.find({}), { added() {}, changed() {}, removed() {} });
     check('observeChanges() after stop creates nothing live', t.db.live('posts').length, 0);
   }
 
@@ -303,8 +305,8 @@ module.exports = function run() {
 
     const seen = [];
     t.publish(function () {
-      const join = this.join(authors);
-      this.cursor(posts.find({}), function (id, doc, changed) {
+      const join = this.relations.join(authors);
+      this.relations.cursor(posts.find({}), function (id, doc, changed) {
         seen.push([changed === true, doc.authorId]);
         if (doc.authorId) join.push(doc.authorId);
       });
@@ -349,9 +351,9 @@ module.exports = function run() {
     t.db.insert('posts', { _id: 'post1', bookId: 'B1', title: 'a' });
 
     t.publish(function () {
-      const join = this.join(authors);
-      this.cursor(posts.find({}), function (id, doc) {
-        this.cursor(books.find({ _id: doc.bookId }), function (bid, book) {
+      const join = this.relations.join(authors);
+      this.relations.cursor(posts.find({}), function (id, doc) {
+        this.relations.cursor(books.find({ _id: doc.bookId }), function (bid, book) {
           join.push(book.authorId);
         });
       });
@@ -389,10 +391,10 @@ module.exports = function run() {
     t.db.insert('posts', { _id: 'post1', title: 'a' });
 
     t.publish(function () {
-      const join = this.join(authors);
-      this.cursor(posts.find({}), function (id, doc) {
+      const join = this.relations.join(authors);
+      this.relations.cursor(posts.find({}), function (id, doc) {
         // built from the parent _id, so the rebuild matches its books again
-        this.cursor(books.find({ postId: id }), function (bid, book) {
+        this.relations.cursor(books.find({ postId: id }), function (bid, book) {
           if (book.authorId) join.push(book.authorId);
         });
       });
@@ -427,10 +429,10 @@ module.exports = function run() {
     t.db.insert('books', { _id: 'B1', authorId: 'A1' });
 
     t.publish(function () {
-      const join = this.join(countries);
-      this.cursor(books.find({}), function (id, doc) {
+      const join = this.relations.join(countries);
+      this.relations.cursor(books.find({}), function (id, doc) {
         if (doc.authorId) {
-          this.cursor(authors.find({ _id: doc.authorId }), function (aid, author) {
+          this.relations.cursor(authors.find({ _id: doc.authorId }), function (aid, author) {
             if (author.countryId) join.push(author.countryId);
           });
         }
@@ -475,10 +477,10 @@ module.exports = function run() {
     t.db.insert('posts', { _id: 'post1', bookId: 'B1', note: 'a' });
 
     t.publish(function () {
-      const join = this.join(authors);
-      this.cursor(posts.find({}), function (id, doc) {
+      const join = this.relations.join(authors);
+      this.relations.cursor(posts.find({}), function (id, doc) {
         // deliberately unguarded - the shape the README warns about
-        this.cursor(books.find({ _id: doc.bookId }), function (bid, book) {
+        this.relations.cursor(books.find({ _id: doc.bookId }), function (bid, book) {
           if (book.authorId) join.push(book.authorId);
         });
       });
@@ -512,9 +514,9 @@ module.exports = function run() {
     t.db.insert('posts', { _id: 'post1', bookId: 'B1', otherBookId: 'B2' });
 
     t.publish(function () {
-      this.cursor(posts.find({}), function (id, doc) {
-        if (doc.bookId) this.cursor(books.find({ _id: doc.bookId }));
-        if (doc.otherBookId) this.cursor(books.find({ _id: doc.otherBookId }));
+      this.relations.cursor(posts.find({}), function (id, doc) {
+        if (doc.bookId) this.relations.cursor(books.find({ _id: doc.bookId }));
+        if (doc.otherBookId) this.relations.cursor(books.find({ _id: doc.otherBookId }));
       });
     });
     check('one observer per guarded cursor', t.db.live('books').map(o => o.selector._id), ['B1', 'B2']);
@@ -526,7 +528,7 @@ module.exports = function run() {
   }
 
   // === a skipped nested cursor must not shift the next one's key ===========
-  // The guarded form the README recommends - `if (doc.someId) this.cursor(...)`
+  // The guarded form the README recommends - `if (doc.someId) this.relations.cursor(...)`
   // - means a callback creates a nested cursor only sometimes. Registry keys are
   // counted per collection so the second cursor still supersedes its own
   // observer rather than being handed the skipped one's slot.
@@ -540,9 +542,9 @@ module.exports = function run() {
     t.db.insert('posts', { _id: 'post1', bookId: 'B1', authorId: 'A1' });
 
     t.publish(function () {
-      this.cursor(posts.find({}), function (id, doc) {
-        if (doc.bookId) this.cursor(books.find({ _id: doc.bookId }));
-        if (doc.authorId) this.cursor(authors.find({ _id: doc.authorId }));
+      this.relations.cursor(posts.find({}), function (id, doc) {
+        if (doc.bookId) this.relations.cursor(books.find({ _id: doc.bookId }));
+        if (doc.authorId) this.relations.cursor(authors.find({ _id: doc.authorId }));
       });
     });
     check('both nested cursors are live', [t.db.live('books').length, t.db.live('authors').length], [1, 1]);
@@ -570,9 +572,9 @@ module.exports = function run() {
     t.db.insert('comments', { _id: 'c1', postId: 'post1', authorId: 'A1' });
 
     t.publish(function () {
-      const join = this.join(authors);
-      this.cursor(posts.find({}), function (id) {
-        this.observeChanges(comments.find({ postId: id }), {
+      const join = this.relations.join(authors);
+      this.relations.cursor(posts.find({}), function (id) {
+        this.relations.observeChanges(comments.find({ postId: id }), {
           added(cid, comment) {
             join.push(comment.authorId);
           },
@@ -605,8 +607,8 @@ module.exports = function run() {
     t.db.insert('posts', { _id: 'post1', authorId: 'A1' });
 
     t.publish(function () {
-      const join = this.join(authors);
-      this.cursor(posts.find({}), {
+      const join = this.relations.join(authors);
+      this.relations.cursor(posts.find({}), {
         added(id, doc) {
           join.push(doc.authorId);
         },
@@ -639,15 +641,15 @@ module.exports = function run() {
 
     const sawMethods = {};
     t.publish(function () {
-      const join = this.join(authors);
-      this.cursor(posts.find({}), {
+      const join = this.relations.join(authors);
+      this.relations.cursor(posts.find({}), {
         added(id, doc) {
-          sawMethods.added = typeof this.cursor === 'function';
+          sawMethods.added = typeof this.relations.cursor === 'function';
           join.push(doc.authorId);
         },
         changed() {},
         removed() {
-          sawMethods.removed = typeof this.cursor === 'function';
+          sawMethods.removed = typeof this.relations.cursor === 'function';
           throw new Error('a callback may throw');
         },
       });
@@ -668,6 +670,35 @@ module.exports = function run() {
     check('but the contribution was released anyway', [t.isPublished('authors', 'A1'), t.db.live('authors').length], [false, 0]);
   }
 
+  // === the API namespace resolves at every depth ===========================
+  // publish_relations.js hands the body the subscription with the package API
+  // on this.relations. A nested callback is handed the per-document
+  // CursorMethods instead, where the same expression has to keep working (the
+  // getter in nonreactive/cursor.js) - and the subscription stays reachable
+  // there as this.sub.
+  {
+    const t = build();
+    const posts = t.db.coll('posts');
+    const comments = t.db.coll('comments');
+    t.db.insert('posts', { _id: 'p1' });
+    t.db.insert('comments', { _id: 'c1', postId: 'p1' });
+
+    const seen = {};
+    t.publish(function () {
+      seen.topIsSub = this === t.sub;
+      seen.topApi = typeof this.relations.cursor === 'function';
+      this.relations.cursor(posts.find({}), function (id) {
+        seen.nestedIsApi = this.relations === this;
+        seen.nestedSub = this.sub === t.sub;
+        this.relations.cursor(comments.find({ postId: id }));
+      });
+    });
+
+    check('the body runs with the subscription as this', [seen.topIsSub, seen.topApi], [true, true]);
+    check('a nested callback resolves this.relations to itself', [seen.nestedIsApi, seen.nestedSub], [true, true]);
+    check('and a cursor opened through it publishes', t.isPublished('comments', 'c1'), true);
+  }
+
   // === joinNonreactive publishes once and observes nothing =================
   {
     const t = build();
@@ -680,12 +711,12 @@ module.exports = function run() {
     const handed = [];
     let join = null;
     t.publish(function () {
-      join = this.joinNonreactive(authors);
+      join = this.relations.joinNonreactive(authors);
       join.selector = _id => {
         handed.push(_id.$in);
         return { _id: _id };
       };
-      this.cursor(posts.find({}), function (id, doc) {
+      this.relations.cursor(posts.find({}), function (id, doc) {
         join.push(doc.authorId);
       });
       join.send();
@@ -696,7 +727,7 @@ module.exports = function run() {
     join.push('A2'); // a late push has to publish on the spot
     check('a late push is published too', t.isPublished('authors', 'A2'), true);
 
-    // The same {$in} shape both times, so a selector written for this.join fits.
+    // The same {$in} shape both times, so a selector written for this.relations.join fits.
     check('the selector is always handed an $in array', handed, [['A1'], ['A2']]);
 
     // ...and a copy of it: this.data keeps growing, the handed array must not.
@@ -719,10 +750,10 @@ module.exports = function run() {
 
     const seen = {};
     t.publish(function () {
-      this.cursor(books.find({}), 'reactive', function (id, doc) {
+      this.relations.cursor(books.find({}), 'reactive', function (id, doc) {
         seen.reactive = doc;
       });
-      this.cursorNonreactive(books.find({}), 'nonreactive', function (id, doc) {
+      this.relations.cursorNonreactive(books.find({}), 'nonreactive', function (id, doc) {
         seen.nonreactive = doc;
       });
     });

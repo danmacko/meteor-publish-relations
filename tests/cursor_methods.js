@@ -26,16 +26,16 @@ Tinytest.addAsync('Relations - observe', function (test, done) {
   };
 
   PublishRelations(publish, function () {
-    this.cursor(quotes.find(), function (id, doc) {
+    this.relations.cursor(quotes.find(), function (id, doc) {
       var productsCursor = products.find({quoteId: id});
 
-      this.observe(productsCursor, {
+      this.relations.observe(productsCursor, {
         added: function (doc) {
           test.equal(doc.name, names[doc.price / 1000]);
         }
       });
 
-      this.observeChanges(productsCursor, {
+      this.relations.observeChanges(productsCursor, {
         added: function (prodId, doc) {
           test.equal(doc.name, names[doc.price / 1000]);
         }
@@ -82,8 +82,8 @@ Tinytest.addAsync('Relations - cursor basic', function (test, done) {
   };
 
   PublishRelations(publish, function () {
-    this.cursor(quotes.find(), function (id, doc) {
-      this.cursor(products.find({quoteId: id}));
+    this.relations.cursor(quotes.find(), function (id, doc) {
+      this.relations.cursor(products.find({quoteId: id}));
     });
   
     return this.ready();
@@ -133,8 +133,8 @@ Tinytest.addAsync('Relations - cursor', function (test, done) {
   };
 
   PublishRelations(publish, function () {
-    this.cursor(quotes.find(), function (id, doc) {
-      this.cursor(products.find({quoteId: id}), function (prodId, prod) {
+    this.relations.cursor(quotes.find(), function (id, doc) {
+      this.relations.cursor(products.find({quoteId: id}), function (prodId, prod) {
         // the callback may edit the document it is publishing
         prod.color = colors[prod.price / 1000];
       });

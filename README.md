@@ -52,9 +52,9 @@ I want publish the autor with his books and comments of the books
 import PublishRelations from 'meteor/danmacko:publish-relations';
 
 PublishRelations('author', function (authorId) {
-  this.cursor(Authors.find(authorId), function (id, doc) {
-    this.cursor(Books.find({authorId: id}), function (id, doc) {
-      this.cursor(Comments.find({bookId: id}));
+  this.relations.cursor(Authors.find(authorId), function (id, doc) {
+    this.relations.cursor(Books.find({authorId: id}), function (id, doc) {
+      this.relations.cursor(Comments.find({bookId: id}));
     });
   });
 
@@ -65,7 +65,36 @@ Note: The above code is very nice and works correctly, but I recommend that you 
 ## Main API
 to use the following methods you should use `PublishRelations` instead of `Meteor.publish`
 
-### this.cursor (cursor, collection, callbacks(id, doc, changed))
+The package's methods live in their own namespace on `this.relations`, so they
+can never collide with something Meteor's `Subscription` gains later. `this` in
+a publication body is the plain subscription, which means `this.userId`,
+`this.added()`, `this.ready()` and `this.onStop()` behave exactly as they do in
+`Meteor.publish`:
+
+```js
+Meteor.publishRelations('books', function () {
+  this.relations.cursor(Books.find({ownerId: this.userId}));
+
+  return this.ready();
+});
+```
+
+Inside a callback the two swap places: `this` is that document's methods object,
+where `this.relations` is a self-reference — so the same expression keeps
+working at any depth — and the subscription is reachable as `this.sub`.
+
+| where | `this` | the package API | the subscription |
+|---|---|---|---|
+| publication body | the `Subscription` | `this.relations` | `this` |
+| inside a callback | that document's methods | `this.relations` (which is `this`) | `this.sub` |
+
+> **Upgrading from 3.x:**
+> earlier versions merged the methods onto the subscription, so `this.cursor()`
+> and `this.ready()` sat on one object. Prefix the package's calls in the
+> publication body with `relations.`; calls inside callbacks need no change,
+> since `this` is the methods object there either way.
+
+### this.relations.cursor (cursor, collection, callbacks(id, doc, changed))
 publishes a cursor, `collection` is not required
 * **collection** is the collection where the cursor will be sent. if not sent, is the default cursor collection name
 * **callbacks** is an object with 3 functions (added, changed, removed) or a function that is called when it is added and changed and receive in third parameter a Boolean value that indicates if is changed
@@ -79,7 +108,7 @@ a field that is *not* in the update adds it to the update, so the client is told
 that field changed — and whatever it already held is overwritten:
 
 ```js
-this.cursor(Meteor.users.find(), function (id, doc, changed) {
+this.relations.cursor(Meteor.users.find(), function (id, doc, changed) {
   // BUG: on any update that does not touch roomId, doc.roomId is undefined, so
   // this puts 'lobby' into the update and the client loses the real roomId
   doc.roomId = doc.roomId || 'lobby';
@@ -89,7 +118,7 @@ this.cursor(Meteor.users.find(), function (id, doc, changed) {
 Guard it on the add, or on the field really being part of the update:
 
 ```js
-this.cursor(Meteor.users.find(), function (id, doc, changed) {
+this.relations.cursor(Meteor.users.find(), function (id, doc, changed) {
   if (!changed || 'roomId' in doc)
     doc.roomId = doc.roomId || 'lobby';
 });
@@ -101,15 +130,15 @@ in the update with the value `undefined` — so the default still applies then.
 Defaults like this are usually better applied where the data is read, since the
 publication has to describe a change and not a state.
 
-### this.join (Collection, options, name)
+### this.relations.join (Collection, options, name)
 It allows you to collect a lot of _ids and then make a single query, only Collection is required.
 * **Collection** is the Mongo Collection to be used
 * **options** the options parameter in a Collection.find
 * **name** the name of a different collection to receive documents there
 
-After creating an instance of `this.join` you can do the following
+After creating an instance of `this.relations.join` you can do the following
 ```js
-const comments = this.join(Comments, {});
+const comments = this.relations.join(Comments, {});
 // default query is {_id: {$in: _ids}}
 // if you need to use another field use selector
 comments.selector = function (_ids) {
@@ -125,12 +154,12 @@ comments.push(id2, id3, id4);
 // not have to worry about reactivity or performance with this method
 comments.send();
 ```
-Why use this and not `this.cursor`? because they are just 2 queries
+Why use this and not `this.relations.cursor`? because they are just 2 queries
 ```js
-const comments = this.join(Comments, {});
+const comments = this.relations.join(Comments, {});
 comments.selector = _ids => ({bookId: _ids});
 
-this.cursor(Books.find(), function (id, doc) {
+this.relations.cursor(Books.find(), function (id, doc) {
   comments.push(id);
 });
 
@@ -149,19 +178,19 @@ through it. Nothing leaks, but a document that has changed fifty times pays for
 fifty of them at once, and there is no way for the package to tell that the
 older ones are finished with.
 
-### this.observe / this.observeChanges (cursor, callbacks)
+### this.relations.observe / this.relations.observeChanges (cursor, callbacks)
 observe or observe changes in a cursor without sending anything to the client, callbacks are the same as those used by meteor
 
 ## Nonreactive API
 The following methods work much like their peers but they are not reactive
 
-### this.cursorNonreactive (cursor, collection, callback)
-It has 2 differences with `this.cursor`
+### this.relations.cursorNonreactive (cursor, collection, callback)
+It has 2 differences with `this.relations.cursor`
 - `callback` is only a function that executes when a document is added
 - you can only use non-reactive methods within the callback
 
-### this.joinNonreactive (Collection, options, name)
-Is exactly the same as `this.join` but non reactive
+### this.relations.joinNonreactive (Collection, options, name)
+Is exactly the same as `this.relations.join` but non reactive
 
 ## Performance Notes
 * every method hands back something with a `stop()` on it, with one exception:
@@ -174,46 +203,46 @@ Is exactly the same as `this.join` but non reactive
 ```js
 // For example we have a collection users and each user has a roomId
 // we want to publish the users and their rooms
-this.cursor(Meteor.users.find(), function (id, doc) {
+this.relations.cursor(Meteor.users.find(), function (id, doc) {
   // this function is executed on added/changed
-  this.cursor(Rooms.find({_id: doc.roomId}));
+  this.relations.cursor(Rooms.find({_id: doc.roomId}));
 });
 // the previous cursor is good but has a bug, when an user is changed we can't make sure
 // that the roomId is changed and 'doc' only comes with the changes, so roomId is undefined
 // and our Rooms cursor no longer work anymore
 
 // to fix the above problem we need to check the roomId
-this.cursor(Meteor.users.find(), function (id, doc) {
+this.relations.cursor(Meteor.users.find(), function (id, doc) {
   if (doc.roomId)
-    this.cursor(Rooms.find({_id: doc.roomId}));
+    this.relations.cursor(Rooms.find({_id: doc.roomId}));
 });
 // or we can use an object with 'added' instead of a function
 // this way is better than the above if we are sure that roomId is not going to change
-this.cursor(Meteor.users.find(), {
+this.relations.cursor(Meteor.users.find(), {
   added: function (id, doc) {
-    this.cursor(Rooms.find({_id: doc.roomId}));
+    this.relations.cursor(Rooms.find({_id: doc.roomId}));
   }
 });
 ```
 * As I said in Quick Start you can do this
 ```js
-this.cursor(Authors.find(authorId), function (id, doc) {
-  this.cursor(Books.find({authorId: id}), function (id, doc) {
-    this.cursor(Comments.find({bookId: id}));
+this.relations.cursor(Authors.find(authorId), function (id, doc) {
+  this.relations.cursor(Books.find({authorId: id}), function (id, doc) {
+    this.relations.cursor(Comments.find({bookId: id}));
   });
 });
 ```
 but you will find that the publication is becoming increasingly slow, suppose you have 10 books for a given author and every book has 100 reviews, with this method would make the following queries:
 1 author + 1 books + 10 comments = 12 queries, for each book found a query is made to find comments which creates a performance issue and publication could take seconds
 
-The solution is to use `this.join` to join all the comments and send them in a single query, passing from 12 queries to 3 queries for mongo
+The solution is to use `this.relations.join` to join all the comments and send them in a single query, passing from 12 queries to 3 queries for mongo
 ```js
-const comments = this.join(Comments);
+const comments = this.relations.join(Comments);
 comments.selector = _ids => ({bookId: _ids});
 
-this.cursor(Authors.find(authorId), function (id, doc) {
+this.relations.cursor(Authors.find(authorId), function (id, doc) {
   // We not have to worry about the books cursor because we only have one author
-  this.cursor(Books.find({authorId: id}), function (id, doc) {
+  this.relations.cursor(Books.find({authorId: id}), function (id, doc) {
     comments.push(id);
   });
 });
@@ -242,14 +271,14 @@ and only the position of the `push` differs:
 
 ```js
 // (1) the callback that reads the key pushes
-this.cursor(Books.find(), function (id, doc) {
+this.relations.cursor(Books.find(), function (id, doc) {
   if (doc.authorId) authors.push(doc.authorId);
 });
 // -> the join holds A1 AND A2
 
 // (2) a cursor that the key rebuilds pushes
-this.cursor(Books.find(), function (id, doc) {
-  if (doc.authorId) this.cursor(Authors.find({_id: doc.authorId}), function (aid, author) {
+this.relations.cursor(Books.find(), function (id, doc) {
+  if (doc.authorId) this.relations.cursor(Authors.find({_id: doc.authorId}), function (aid, author) {
     countries.push(author.countryId);
   });
 });
@@ -290,28 +319,28 @@ Client code normally reads joined documents by the foreign key it finds on the
 parent, so a superseded one is simply never looked up; where the collection
 itself is what gets rendered, filter it by the keys the parent documents hold.
 
-### Two guarded `this.cursor` calls on the same collection, in one callback
+### Two guarded `this.relations.cursor` calls on the same collection, in one callback
 
 Needs all four of these together, so most publications can stop reading here:
 
-* two or more `this.cursor` calls **on the same collection**
+* two or more `this.relations.cursor` calls **on the same collection**
 * both inside the **same callback**
 * at least one of them **guarded** by an `if`
 * an update that reaches a later call while skipping an earlier one
 
-`this.join` is not affected at all, however many joins there are on a
+`this.relations.join` is not affected at all, however many joins there are on a
 collection: a join takes its slot key once, when it is constructed in the
 publication body, and keeps it for the life of the subscription.
 
 A nested cursor, by contrast, is identified by its collection and by the order of
-the `this.cursor` calls in the callback - which is what lets a re-run replace its
+the `this.relations.cursor` calls in the callback - which is what lets a re-run replace its
 own observer. A guard breaks that ordering when two of them are on the same
 collection:
 
 ```js
-this.cursor(Books.find(), function (id, doc) {
-  if (doc.mainAuthorId) this.cursor(Authors.find({_id: doc.mainAuthorId}));
-  if (doc.editorId) this.cursor(Authors.find({_id: doc.editorId}));   // same collection
+this.relations.cursor(Books.find(), function (id, doc) {
+  if (doc.mainAuthorId) this.relations.cursor(Authors.find({_id: doc.mainAuthorId}));
+  if (doc.editorId) this.relations.cursor(Authors.find({_id: doc.editorId}));   // same collection
 });
 ```
 
@@ -329,7 +358,7 @@ updates for a document the publication no longer wants.
 
 Two cursors on one collection are fine unguarded, and any number of guarded
 cursors are fine on *different* collections. Only the combination bites. Send
-one of the two under its own name - `this.cursor(cursor, 'editors')` is a
+one of the two under its own name - `this.relations.cursor(cursor, 'editors')` is a
 separate slot, and a separate collection on the client - or use the `added`
 form from Performance Notes, which does not re-run at all. Removing the guards
 is not a fix: the callback is handed the update, so the selector would be built
@@ -351,10 +380,10 @@ more:
 
 ```js
 // Rooms are sent twice here: by the join, and by the nested cursor.
-this.cursor(Meteor.users.find(), function (id, doc) {
+this.relations.cursor(Meteor.users.find(), function (id, doc) {
   if (doc.roomId) {
     rooms.push(doc.roomId);                       // <- keeps the two in step
-    this.cursor(Rooms.find({_id: doc.roomId}), function (id, room) {
+    this.relations.cursor(Rooms.find({_id: doc.roomId}), function (id, room) {
       owners.push(room.ownerId);
     });
   }
@@ -364,8 +393,8 @@ this.cursor(Meteor.users.find(), function (id, doc) {
 That is worth checking whenever a publication has both a join and a cursor on
 one collection: for every such cursor there should be a push into the matching
 join. Where that is not possible, either give one of them its own name
-(`this.cursor(cursor, 'roomsLookup', callbacks)`, which sends it to a separate
-client collection) or use `this.observe`, which runs callbacks without sending
+(`this.relations.cursor(cursor, 'roomsLookup', callbacks)`, which sends it to a separate
+client collection) or use `this.relations.observe`, which runs callbacks without sending
 anything at all.
 
 In development the package warns when this bites — once per collection, when a

@@ -1,7 +1,7 @@
 // The contributor frame under concurrency.
 //
 // A publication has one observe multiplexer queue per cursor, and a nested
-// this.cursor() yields while observeChanges() builds its observer - so two of a
+// this.relations.cursor() yields while observeChanges() builds its observer - so two of a
 // publication's callbacks can be suspended at the same time. That is the case a
 // shared stack on the subscription cannot survive: whoever resumes first reads
 // whatever frame was pushed last, and the pops then unwind in the wrong order.

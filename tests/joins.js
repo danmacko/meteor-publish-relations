@@ -47,8 +47,8 @@ Tinytest.addAsync('Join - publishes joined docs and retracts orphans', function 
   posts.insert({ _id: 'post2', authorId: 'a2' });
 
   PublishRelations(publish, function () {
-    const join = this.join(authors);
-    this.cursor(posts.find(), function (id, doc) {
+    const join = this.relations.join(authors);
+    this.relations.cursor(posts.find(), function (id, doc) {
       join.push(doc.authorId);
     });
     join.send();
@@ -96,8 +96,8 @@ Tinytest.addAsync('Join - a shared joined doc survives one contributor leaving',
   posts.insert({ _id: 'post3', authorId: 'solo' });
 
   PublishRelations(publish, function () {
-    const join = this.join(authors);
-    this.cursor(posts.find(), function (id, doc) {
+    const join = this.relations.join(authors);
+    this.relations.cursor(posts.find(), function (id, doc) {
       join.push(doc.authorId);
     });
     join.send();
@@ -142,12 +142,12 @@ Tinytest.addAsync('Join - two joins on one collection stay reactive', function (
   authors.insert({ _id: 'pseudonymous', postId: 'none', pseudonym: 'ghost', v: 0 });
 
   PublishRelations(publish, function () {
-    const byPost = this.join(authors);
+    const byPost = this.relations.join(authors);
     byPost.selector = (_ids) => ({ postId: _ids });
-    const byPseudonym = this.join(authors);
+    const byPseudonym = this.relations.join(authors);
     byPseudonym.selector = (_ids) => ({ pseudonym: _ids });
 
-    this.cursor(posts.find(), function (id, doc) {
+    this.relations.cursor(posts.find(), function (id, doc) {
       byPost.push(id);
       byPseudonym.push(doc.pseudonym);
     });
@@ -206,8 +206,8 @@ Tinytest.addAsync('Cursor - two cursors on one collection stay reactive', functi
   posts.insert({ _id: 'b1', tag: 'b', v: 0 });
 
   PublishRelations(publish, function () {
-    this.cursor(posts.find({ tag: 'a' }));
-    this.cursor(posts.find({ tag: 'b' }));
+    this.relations.cursor(posts.find({ tag: 'a' }));
+    this.relations.cursor(posts.find({ tag: 'b' }));
 
     return this.ready();
   });
@@ -256,9 +256,9 @@ Tinytest.addAsync('Join - custom selector never retracts wrongly', function (tes
   authors.insert({ _id: 'a2', postId: 'post2' });
 
   PublishRelations(publish, function () {
-    const join = this.join(authors);
+    const join = this.relations.join(authors);
     join.selector = (_ids) => ({ postId: _ids });
-    this.cursor(posts.find(), function (id) {
+    this.relations.cursor(posts.find(), function (id) {
       join.push(id);
     });
     join.send();
@@ -302,8 +302,8 @@ Tinytest.addAsync('Teardown - unsubscribing stops every observer', function (tes
   posts.insert({ _id: 'post1', authorId: 'a1' });
 
   PublishRelations(publish, function () {
-    const join = this.join(authors);
-    this.cursor(posts.find(), function (id, doc) {
+    const join = this.relations.join(authors);
+    this.relations.cursor(posts.find(), function (id, doc) {
       join.push(doc.authorId);
     });
     join.send();
@@ -346,8 +346,8 @@ Tinytest.addAsync('Join - repeated restarts do not leak observers', function (te
   posts.insert({ _id: 'post0', authorId: 'a0' });
 
   PublishRelations(publish, function () {
-    const join = this.join(authors);
-    this.cursor(posts.find(), function (id, doc) {
+    const join = this.relations.join(authors);
+    this.relations.cursor(posts.find(), function (id, doc) {
       join.push(doc.authorId);
     });
     join.send();
@@ -398,7 +398,7 @@ Tinytest.addAsync('Join - two subscriptions holding the same ids share one obser
   ['a1', 'a2', 'a3'].forEach(id => authors.insert({ _id: id, name: id }));
 
   PublishRelations(publish, function (reversed) {
-    const join = this.join(authors);
+    const join = this.relations.join(authors);
     const ids = reversed ? ['a3', 'a2', 'a1'] : ['a1', 'a2', 'a3'];
     ids.forEach(id => join.push(id));
     join.send();
@@ -450,8 +450,8 @@ Tinytest.addAsync('Nested cursor - re-runs do not leak observers', function (tes
   comments.insert({ _id: 'c1', postId: 'post1' });
 
   PublishRelations(publish, function () {
-    this.cursor(posts.find(), function (id, doc) {
-      this.cursor(comments.find({ postId: id }));
+    this.relations.cursor(posts.find(), function (id, doc) {
+      this.relations.cursor(comments.find({ postId: id }));
     });
 
     return this.ready();
@@ -500,9 +500,9 @@ Tinytest.addAsync('Join - parent leaving the window cascades to nested contribut
   comments.insert({ _id: 'c1', postId: 'post1', authorId: 'a1' });
 
   PublishRelations(publish, function () {
-    const join = this.join(authors);
-    this.cursor(posts.find({ active: true }), function (id, doc) {
-      this.cursor(comments.find({ postId: id }), function (commentId, comment) {
+    const join = this.relations.join(authors);
+    this.relations.cursor(posts.find({ active: true }), function (id, doc) {
+      this.relations.cursor(comments.find({ postId: id }), function (commentId, comment) {
         join.push(comment.authorId);
       });
     });
