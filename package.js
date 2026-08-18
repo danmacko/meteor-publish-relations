@@ -7,10 +7,11 @@ Package.describe({
 });
 
 Package.onUse(function (api) {
-  api.versionsFrom('2.3');
+  api.versionsFrom('3.0');
 
   api.use([
-    'ecmascript'
+    'ecmascript',
+    'ejson'
   ]);
 
   api.mainModule('lib/server/index.js', 'server');

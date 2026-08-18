@@ -20,7 +20,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-RELEASE="${METEOR_RELEASE:-METEOR@2.15}"
+RELEASE="${METEOR_RELEASE:-METEOR@3.4.1}"
 PORT="${PORT:-3199}"
 
 # Prefer a system node, but only one new enough for `require('node:...')`

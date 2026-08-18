@@ -7,6 +7,10 @@
 const { loadModules, makeMeteorStub, createReporter, FakeDB, makeSub } = require('./harness');
 
 const MODULES = [
+  'thenable.js',
+  'serial.js',
+  'observe-lock.js',
+  'cursor/write-queue.js',
   'cursor/published.js',
   'cursor/contributor-context.js',
   'cursor/nonreactive/cursor.js',
@@ -18,7 +22,10 @@ const MODULES = [
   'cursor/join.js',
 ];
 
-module.exports = function run() {
+// Long enough to be a real suspension, short enough not to slow the layer down.
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+module.exports = async function run() {
   const { check, report } = createReporter('unit: publication stack');
 
   function build() {
@@ -32,11 +39,15 @@ module.exports = function run() {
     const { sub, events, isPublished } = makeSub();
 
     // Mirrors publish_relations.js: the body runs with the subscription as
-    // `this` and the package API in its own namespace on this.relations.
-    function publish(fn) {
+    // `this` and the package API in its own namespace on this.relations, and
+    // what it registered is settled before the publication counts as done -
+    // which is what the wrapper holds ready() back for.
+    async function publish(fn) {
       const root = new sandbox.HandlerController();
-      sub.relations = new sandbox.CursorMethods(sub, root);
-      fn.apply(sub);
+      const relations = new sandbox.CursorMethods(sub, root);
+      sub.relations = relations;
+      await fn.apply(sub);
+      await relations._settle();
       return root;
     }
 
@@ -57,12 +68,12 @@ module.exports = function run() {
     const t = build();
     const posts = t.db.coll('posts');
     const authors = t.db.coll('authors');
-    t.db.insert('posts', { _id: 'post1', pseudonym: 'ghost' });
-    t.db.insert('posts', { _id: 'post2', pseudonym: 'anon' });
-    t.db.insert('authors', { _id: 'A1', postId: 'post1', pseudonym: 'ghost' }); // both joins
-    t.db.insert('authors', { _id: 'A2', postId: 'post2', pseudonym: 'none' }); // first join only
+    await t.db.insertAsync('posts', { _id: 'post1', pseudonym: 'ghost' });
+    await t.db.insertAsync('posts', { _id: 'post2', pseudonym: 'anon' });
+    await t.db.insertAsync('authors', { _id: 'A1', postId: 'post1', pseudonym: 'ghost' }); // both joins
+    await t.db.insertAsync('authors', { _id: 'A2', postId: 'post2', pseudonym: 'none' }); // first join only
 
-    t.publish(function () {
+    await t.publish(function () {
       const byPost = this.relations.join(authors);
       byPost.selector = _ids => ({ postId: _ids });
       const byPseudonym = this.relations.join(authors);
@@ -80,9 +91,9 @@ module.exports = function run() {
 
     // Restarting one join must not disturb the other's observer.
     const before = t.db.live('authors').find(o => 'pseudonym' in o.selector);
-    t.db.insert('authors', { _id: 'A3', postId: 'post3', pseudonym: 'none' });
-    t.db.insert('posts', { _id: 'post3' }); // no pseudonym -> only the first join pushes
-    t.flush();
+    await t.db.insertAsync('authors', { _id: 'A3', postId: 'post3', pseudonym: 'none' });
+    await t.db.insertAsync('posts', { _id: 'post3' }); // no pseudonym -> only the first join pushes
+    await t.flush();
     check(
       'other join observer untouched by the restart',
       before === t.db.live('authors').find(o => 'pseudonym' in o.selector),
@@ -92,12 +103,12 @@ module.exports = function run() {
     check('still exactly two observers', t.db.live('authors').length, 2);
 
     // A doc both observers match is deleted: exactly one removed, no throw.
-    t.db.remove('authors', 'A1');
+    await t.db.removeAsync('authors', 'A1');
     check('overlapping delete removes once', t.events.filter(e => e[0] === 'removed' && e[2] === 'A1').length, 1);
 
     // Releasing a custom-selector join must not retract by foreign key.
-    t.db.remove('posts', 'post2');
-    t.flush();
+    await t.db.removeAsync('posts', 'post2');
+    await t.flush();
     check('custom selector never false-retracts', t.isPublished('authors', 'A2'), true);
   }
 
@@ -106,10 +117,10 @@ module.exports = function run() {
     const t = build();
     const posts = t.db.coll('posts');
     const authors = t.db.coll('authors');
-    t.db.insert('posts', { _id: 'post1', pseudonym: 'ghost' });
-    t.db.insert('authors', { _id: 'A1', postId: 'post1', pseudonym: 'ghost' }); // both joins
+    await t.db.insertAsync('posts', { _id: 'post1', pseudonym: 'ghost' });
+    await t.db.insertAsync('authors', { _id: 'A1', postId: 'post1', pseudonym: 'ghost' }); // both joins
 
-    t.publish(function () {
+    await t.publish(function () {
       const byPost = this.relations.join(authors);
       byPost.selector = _ids => ({ postId: _ids });
       const byPseudonym = this.relations.join(authors);
@@ -124,17 +135,17 @@ module.exports = function run() {
     check('overlapping doc published', t.isPublished('authors', 'A1'), true);
 
     // Leaves the first join's selector; the second still matches it.
-    t.db.update('authors', 'A1', { postId: 'gone' });
+    await t.db.updateAsync('authors', 'A1', { postId: 'gone' });
     check('doc is hidden, no throw', t.isPublished('authors', 'A1'), false);
 
     // The second observer now fires changed for a doc that is already gone.
-    t.db.update('authors', 'A1', { note: 'edit' });
+    await t.db.updateAsync('authors', 'A1', { note: 'edit' });
     check('changed for a hidden doc is suppressed', t.isPublished('authors', 'A1'), false);
     check('dev warning fired once', t.warnings.filter(w => w.indexOf("'authors'") !== -1).length, 1);
 
     // The hide heals when the surviving join restarts.
-    t.db.insert('posts', { _id: 'post2', pseudonym: 'other' });
-    t.flush();
+    await t.db.insertAsync('posts', { _id: 'post2', pseudonym: 'other' });
+    await t.flush();
     check('hidden doc restored by the next restart', t.isPublished('authors', 'A1'), true);
   }
 
@@ -142,10 +153,10 @@ module.exports = function run() {
   {
     const t = build();
     const posts = t.db.coll('posts');
-    t.db.insert('posts', { _id: 'a1', tag: 'a' });
-    t.db.insert('posts', { _id: 'b1', tag: 'b' });
+    await t.db.insertAsync('posts', { _id: 'a1', tag: 'a' });
+    await t.db.insertAsync('posts', { _id: 'b1', tag: 'b' });
 
-    const root = t.publish(function () {
+    const root = await t.publish(function () {
       this.relations.cursor(posts.find({ tag: 'a' }));
       this.relations.cursor(posts.find({ tag: 'b' }));
     });
@@ -153,7 +164,7 @@ module.exports = function run() {
     check('both cursors are live', t.db.live('posts').length, 2);
     check('both result sets published', [t.isPublished('posts', 'a1'), t.isPublished('posts', 'b1')], [true, true]);
 
-    t.db.update('posts', 'a1', { title: 't' });
+    await t.db.updateAsync('posts', 'a1', { title: 't' });
     check('first cursor is still reactive', t.events.filter(e => e[0] === 'changed' && e[2] === 'a1').length, 1);
 
     root.stop();
@@ -165,12 +176,12 @@ module.exports = function run() {
     const t = build();
     const posts = t.db.coll('posts');
     const authors = t.db.coll('authors');
-    t.db.insert('authors', { _id: 'A1' });
-    t.db.insert('authors', { _id: 'A2' });
-    t.db.insert('posts', { _id: 'post1', authorId: 'A1' });
-    t.db.insert('posts', { _id: 'post2', authorId: 'A2' });
+    await t.db.insertAsync('authors', { _id: 'A1' });
+    await t.db.insertAsync('authors', { _id: 'A2' });
+    await t.db.insertAsync('posts', { _id: 'post1', authorId: 'A1' });
+    await t.db.insertAsync('posts', { _id: 'post2', authorId: 'A2' });
 
-    t.publish(function () {
+    await t.publish(function () {
       const join = this.relations.join(authors);
       this.relations.cursor(posts.find({}), function (id, doc) {
         join.push(doc.authorId);
@@ -179,8 +190,8 @@ module.exports = function run() {
     });
     check('both joined docs published', [t.isPublished('authors', 'A1'), t.isPublished('authors', 'A2')], [true, true]);
 
-    t.db.remove('posts', 'post2'); // last contributor of A2
-    t.flush();
+    await t.db.removeAsync('posts', 'post2'); // last contributor of A2
+    await t.flush();
     check('orphaned joined doc retracted', t.isPublished('authors', 'A2'), false);
     check('still-referenced doc untouched', t.isPublished('authors', 'A1'), true);
     check('exactly one removed sent', t.events.filter(e => e[0] === 'removed' && e[1] === 'authors').length, 1);
@@ -195,11 +206,11 @@ module.exports = function run() {
     const posts = t.db.coll('posts');
     const tasks = t.db.coll('tasks');
     const authors = t.db.coll('authors');
-    t.db.insert('authors', { _id: 'A1' });
-    t.db.insert('posts', { _id: 'x1', authorId: 'A1' });
-    t.db.insert('tasks', { _id: 'x1', authorId: 'A1' });
+    await t.db.insertAsync('authors', { _id: 'A1' });
+    await t.db.insertAsync('posts', { _id: 'x1', authorId: 'A1' });
+    await t.db.insertAsync('tasks', { _id: 'x1', authorId: 'A1' });
 
-    t.publish(function () {
+    await t.publish(function () {
       const join = this.relations.join(authors);
       this.relations.cursor(posts.find({}), function (id, doc) {
         join.push(doc.authorId);
@@ -211,13 +222,13 @@ module.exports = function run() {
     });
     check('joined doc published', t.isPublished('authors', 'A1'), true);
 
-    t.db.remove('posts', 'x1'); // the task sharing the _id still references A1
-    t.flush();
+    await t.db.removeAsync('posts', 'x1'); // the task sharing the _id still references A1
+    await t.flush();
     check('a same-_id sibling keeps the joined doc', t.isPublished('authors', 'A1'), true);
     check('the $in still holds it', joinedIds(t, 'authors'), ['A1']);
 
-    t.db.remove('tasks', 'x1'); // now the last contributor is gone
-    t.flush();
+    await t.db.removeAsync('tasks', 'x1'); // now the last contributor is gone
+    await t.flush();
     check('the last contributor leaving retracts it', t.isPublished('authors', 'A1'), false);
   }
 
@@ -226,10 +237,10 @@ module.exports = function run() {
     const t = build();
     const posts = t.db.coll('posts');
     const authors = t.db.coll('authors');
-    t.db.insert('authors', { _id: 'A1' });
-    t.db.insert('posts', { _id: 'p1', tag: 'a', flagged: true, authorId: 'A1' });
+    await t.db.insertAsync('authors', { _id: 'A1' });
+    await t.db.insertAsync('posts', { _id: 'p1', tag: 'a', flagged: true, authorId: 'A1' });
 
-    t.publish(function () {
+    await t.publish(function () {
       const join = this.relations.join(authors);
       this.relations.cursor(posts.find({ tag: 'a' }), function (id, doc) {
         join.push(doc.authorId);
@@ -241,8 +252,8 @@ module.exports = function run() {
     });
     check('joined doc published once', t.events.filter(e => e[0] === 'added' && e[2] === 'A1').length, 1);
 
-    t.db.update('posts', 'p1', { tag: 'b' }); // leaves the first cursor, stays in the second
-    t.flush();
+    await t.db.updateAsync('posts', 'p1', { tag: 'b' }); // leaves the first cursor, stays in the second
+    await t.flush();
     check('the still-matching cursor keeps the join alive', joinedIds(t, 'authors'), ['A1']);
   }
 
@@ -251,11 +262,11 @@ module.exports = function run() {
     const t = build();
     const posts = t.db.coll('posts');
     const comments = t.db.coll('comments');
-    t.db.insert('posts', { _id: 'p1' });
-    t.db.insert('comments', { _id: 'c1', postId: 'p1' });
+    await t.db.insertAsync('posts', { _id: 'p1' });
+    await t.db.insertAsync('comments', { _id: 'c1', postId: 'p1' });
 
     let resume = null;
-    const root = t.publish(function () {
+    const root = await t.publish(function () {
       this.relations.cursor(posts.find({}), function (id) {
         // models a callback that yields (a findOne) before opening its nested cursor
         resume = () => this.relations.cursor(comments.find({ postId: id }));
@@ -273,18 +284,20 @@ module.exports = function run() {
   {
     const t = build();
     const posts = t.db.coll('posts');
-    t.db.insert('posts', { _id: 'p1' });
+    await t.db.insertAsync('posts', { _id: 'p1' });
 
     let relations = null;
-    const root = t.publish(function () {
+    const root = await t.publish(function () {
       relations = this.relations;
     });
     root.stop();
 
-    relations.cursor(posts.find({}));
+    // Awaited, or the checks would be reading the world before the registration
+    // has had a chance to create anything and would pass on a leak too.
+    await relations.cursor(posts.find({}));
     check('cursor() after stop creates nothing live', t.db.live('posts').length, 0);
 
-    relations.observeChanges(posts.find({}), { added() {}, changed() {}, removed() {} });
+    await relations.observeChanges(posts.find({}), { added() {}, changed() {}, removed() {} });
     check('observeChanges() after stop creates nothing live', t.db.live('posts').length, 0);
   }
 
@@ -300,11 +313,11 @@ module.exports = function run() {
     const t = build();
     const posts = t.db.coll('posts');
     const authors = t.db.coll('authors');
-    t.db.insert('authors', { _id: 'A1' });
-    t.db.insert('posts', { _id: 'post1', authorId: 'A1', title: 'a' });
+    await t.db.insertAsync('authors', { _id: 'A1' });
+    await t.db.insertAsync('posts', { _id: 'post1', authorId: 'A1', title: 'a' });
 
     const seen = [];
-    t.publish(function () {
+    await t.publish(function () {
       const join = this.relations.join(authors);
       this.relations.cursor(posts.find({}), function (id, doc, changed) {
         seen.push([changed === true, doc.authorId]);
@@ -314,8 +327,8 @@ module.exports = function run() {
     });
     check('the linked doc is published', t.isPublished('authors', 'A1'), true);
 
-    t.db.update('posts', 'post1', { title: 'b' }); // unrelated field
-    t.flush();
+    await t.db.updateAsync('posts', 'post1', { title: 'b' }); // unrelated field
+    await t.flush();
     check('the callback saw only the delta', seen, [[false, 'A1'], [true, undefined]]);
     check('the unrelated change did not release the link', t.isPublished('authors', 'A1'), true);
     check('and the $in still holds it', joinedIds(t, 'authors'), ['A1']);
@@ -324,14 +337,14 @@ module.exports = function run() {
     // declares A2 - and nothing says A1 is no longer declared, because a re-run
     // adds to what a callback contributes and never replaces it. The old id is
     // held until the contributing document itself leaves.
-    t.db.insert('authors', { _id: 'A2' });
-    t.db.update('posts', 'post1', { authorId: 'A2' });
-    t.flush();
+    await t.db.insertAsync('authors', { _id: 'A2' });
+    await t.db.updateAsync('posts', 'post1', { authorId: 'A2' });
+    await t.flush();
     check('the new link is published', t.isPublished('authors', 'A2'), true);
     check('and the old one is kept as well', joinedIds(t, 'authors'), ['A1', 'A2']);
 
-    t.db.remove('posts', 'post1'); // the contributor leaves: both go
-    t.flush();
+    await t.db.removeAsync('posts', 'post1'); // the contributor leaves: both go
+    await t.flush();
     check('the pin ends with the contributor', t.db.live('authors').length, 0);
   }
 
@@ -346,11 +359,11 @@ module.exports = function run() {
     const posts = t.db.coll('posts');
     const books = t.db.coll('books');
     const authors = t.db.coll('authors');
-    t.db.insert('authors', { _id: 'A1' });
-    t.db.insert('books', { _id: 'B1', authorId: 'A1' });
-    t.db.insert('posts', { _id: 'post1', bookId: 'B1', title: 'a' });
+    await t.db.insertAsync('authors', { _id: 'A1' });
+    await t.db.insertAsync('books', { _id: 'B1', authorId: 'A1' });
+    await t.db.insertAsync('posts', { _id: 'post1', bookId: 'B1', title: 'a' });
 
-    t.publish(function () {
+    await t.publish(function () {
       const join = this.relations.join(authors);
       this.relations.cursor(posts.find({}), function (id, doc) {
         this.relations.cursor(books.find({ _id: doc.bookId }), function (bid, book) {
@@ -361,13 +374,13 @@ module.exports = function run() {
     });
     check('the joined doc is published', t.isPublished('authors', 'A1'), true);
 
-    t.db.update('posts', 'post1', { title: 'b' }); // does not touch bookId
-    t.flush();
+    await t.db.updateAsync('posts', 'post1', { title: 'b' }); // does not touch bookId
+    await t.flush();
     check('an unrelated parent edit keeps it', t.isPublished('authors', 'A1'), true);
     check('and the $in still holds it', joinedIds(t, 'authors'), ['A1']);
 
-    t.db.remove('posts', 'post1'); // the parent really leaves
-    t.flush();
+    await t.db.removeAsync('posts', 'post1'); // the parent really leaves
+    await t.flush();
     check('the parent leaving does release it', t.isPublished('authors', 'A1'), false);
     check('and an empty membership keeps no observer', t.db.live('authors').length, 0);
   }
@@ -384,13 +397,13 @@ module.exports = function run() {
     const posts = t.db.coll('posts');
     const books = t.db.coll('books');
     const authors = t.db.coll('authors');
-    t.db.insert('authors', { _id: 'A1' });
-    t.db.insert('authors', { _id: 'A2' });
-    t.db.insert('books', { _id: 'B1', postId: 'post1', authorId: 'A1' });
-    t.db.insert('books', { _id: 'B2', postId: 'post1', authorId: 'A2' });
-    t.db.insert('posts', { _id: 'post1', title: 'a' });
+    await t.db.insertAsync('authors', { _id: 'A1' });
+    await t.db.insertAsync('authors', { _id: 'A2' });
+    await t.db.insertAsync('books', { _id: 'B1', postId: 'post1', authorId: 'A1' });
+    await t.db.insertAsync('books', { _id: 'B2', postId: 'post1', authorId: 'A2' });
+    await t.db.insertAsync('posts', { _id: 'post1', title: 'a' });
 
-    t.publish(function () {
+    await t.publish(function () {
       const join = this.relations.join(authors);
       this.relations.cursor(posts.find({}), function (id, doc) {
         // built from the parent _id, so the rebuild matches its books again
@@ -402,12 +415,12 @@ module.exports = function run() {
     });
     check('both authors joined', joinedIds(t, 'authors'), ['A1', 'A2']);
 
-    t.db.update('posts', 'post1', { title: 'b' }); // rebuilds the nested cursor
-    t.flush();
+    await t.db.updateAsync('posts', 'post1', { title: 'b' }); // rebuilds the nested cursor
+    await t.flush();
     check('the rebuild holds them both', joinedIds(t, 'authors'), ['A1', 'A2']);
 
-    t.db.remove('books', 'B2'); // one nested doc leaves, the parent stays
-    t.flush();
+    await t.db.removeAsync('books', 'B2'); // one nested doc leaves, the parent stays
+    await t.flush();
     check('and one child leaving releases exactly its own', joinedIds(t, 'authors'), ['A1']);
     check('the orphan is retracted', t.isPublished('authors', 'A2'), false);
   }
@@ -422,13 +435,13 @@ module.exports = function run() {
     const books = t.db.coll('books');
     const authors = t.db.coll('authors');
     const countries = t.db.coll('countries');
-    t.db.insert('countries', { _id: 'C1' });
-    t.db.insert('countries', { _id: 'C2' });
-    t.db.insert('authors', { _id: 'A1', countryId: 'C1' });
-    t.db.insert('authors', { _id: 'A2', countryId: 'C2' });
-    t.db.insert('books', { _id: 'B1', authorId: 'A1' });
+    await t.db.insertAsync('countries', { _id: 'C1' });
+    await t.db.insertAsync('countries', { _id: 'C2' });
+    await t.db.insertAsync('authors', { _id: 'A1', countryId: 'C1' });
+    await t.db.insertAsync('authors', { _id: 'A2', countryId: 'C2' });
+    await t.db.insertAsync('books', { _id: 'B1', authorId: 'A1' });
 
-    t.publish(function () {
+    await t.publish(function () {
       const join = this.relations.join(countries);
       this.relations.cursor(books.find({}), function (id, doc) {
         if (doc.authorId) {
@@ -447,16 +460,16 @@ module.exports = function run() {
 
     // (2) the rebuilt cursor matches A2, so it re-declares for itself and what
     // A1 declared goes - off the client too, not only out of the {$in}.
-    t.db.update('books', 'B1', { authorId: 'A2' });
-    t.flush();
+    await t.db.updateAsync('books', 'B1', { authorId: 'A2' });
+    await t.flush();
     check('re-pointing releases what the old author declared', joined(), ['C2']);
     check('and retracts it from the client', t.isPublished('countries', 'C1'), false);
     check('while the new one is published', t.isPublished('countries', 'C2'), true);
 
     // (3) the key is present and the selector is valid, but nothing matches it.
     // Indistinguishable from "the update did not carry the key", so it is kept.
-    t.db.update('books', 'B1', { authorId: 'A404' });
-    t.flush();
+    await t.db.updateAsync('books', 'B1', { authorId: 'A404' });
+    await t.flush();
     check('re-pointing at nothing keeps the old declaration', joined(), ['C2']);
     check('and leaves it on the client', t.isPublished('countries', 'C2'), true);
   }
@@ -472,11 +485,11 @@ module.exports = function run() {
     const posts = t.db.coll('posts');
     const books = t.db.coll('books');
     const authors = t.db.coll('authors');
-    t.db.insert('authors', { _id: 'A1' });
-    t.db.insert('books', { _id: 'B1', authorId: 'A1', title: 'orig' });
-    t.db.insert('posts', { _id: 'post1', bookId: 'B1', note: 'a' });
+    await t.db.insertAsync('authors', { _id: 'A1' });
+    await t.db.insertAsync('books', { _id: 'B1', authorId: 'A1', title: 'orig' });
+    await t.db.insertAsync('posts', { _id: 'post1', bookId: 'B1', note: 'a' });
 
-    t.publish(function () {
+    await t.publish(function () {
       const join = this.relations.join(authors);
       this.relations.cursor(posts.find({}), function (id, doc) {
         // deliberately unguarded - the shape the README warns about
@@ -487,13 +500,13 @@ module.exports = function run() {
       join.send();
     });
 
-    t.db.update('posts', 'post1', { note: 'b' }); // rebuilds on {_id: undefined}
-    t.flush();
+    await t.db.updateAsync('posts', 'post1', { note: 'b' }); // rebuilds on {_id: undefined}
+    await t.flush();
     check('the join keeps its member', joinedIds(t, 'authors'), ['A1']);
     check('and the book is still on the client', t.isPublished('books', 'B1'), true);
 
     const before = t.events.length;
-    t.db.update('books', 'B1', { title: 'edited' });
+    await t.db.updateAsync('books', 'B1', { title: 'edited' });
     check('but nothing observes it any more', t.events.length > before, false);
   }
 
@@ -508,12 +521,12 @@ module.exports = function run() {
     const t = build();
     const posts = t.db.coll('posts');
     const books = t.db.coll('books');
-    t.db.insert('books', { _id: 'B1' });
-    t.db.insert('books', { _id: 'B2' });
-    t.db.insert('books', { _id: 'B3' });
-    t.db.insert('posts', { _id: 'post1', bookId: 'B1', otherBookId: 'B2' });
+    await t.db.insertAsync('books', { _id: 'B1' });
+    await t.db.insertAsync('books', { _id: 'B2' });
+    await t.db.insertAsync('books', { _id: 'B3' });
+    await t.db.insertAsync('posts', { _id: 'post1', bookId: 'B1', otherBookId: 'B2' });
 
-    t.publish(function () {
+    await t.publish(function () {
       this.relations.cursor(posts.find({}), function (id, doc) {
         if (doc.bookId) this.relations.cursor(books.find({ _id: doc.bookId }));
         if (doc.otherBookId) this.relations.cursor(books.find({ _id: doc.otherBookId }));
@@ -521,8 +534,8 @@ module.exports = function run() {
     });
     check('one observer per guarded cursor', t.db.live('books').map(o => o.selector._id), ['B1', 'B2']);
 
-    t.db.update('posts', 'post1', { otherBookId: 'B3' }); // the delta skips the first guard
-    t.flush();
+    await t.db.updateAsync('posts', 'post1', { otherBookId: 'B3' }); // the delta skips the first guard
+    await t.flush();
     check('the second cursor took the first ones slot', t.db.live('books').map(o => o.selector._id), ['B2', 'B3']);
     check('leaving B1 published with nothing observing it', t.isPublished('books', 'B1'), true);
   }
@@ -537,11 +550,11 @@ module.exports = function run() {
     const posts = t.db.coll('posts');
     const books = t.db.coll('books');
     const authors = t.db.coll('authors');
-    t.db.insert('books', { _id: 'B1' });
-    t.db.insert('authors', { _id: 'A1' });
-    t.db.insert('posts', { _id: 'post1', bookId: 'B1', authorId: 'A1' });
+    await t.db.insertAsync('books', { _id: 'B1' });
+    await t.db.insertAsync('authors', { _id: 'A1' });
+    await t.db.insertAsync('posts', { _id: 'post1', bookId: 'B1', authorId: 'A1' });
 
-    t.publish(function () {
+    await t.publish(function () {
       this.relations.cursor(posts.find({}), function (id, doc) {
         if (doc.bookId) this.relations.cursor(books.find({ _id: doc.bookId }));
         if (doc.authorId) this.relations.cursor(authors.find({ _id: doc.authorId }));
@@ -550,8 +563,8 @@ module.exports = function run() {
     check('both nested cursors are live', [t.db.live('books').length, t.db.live('authors').length], [1, 1]);
 
     // an update carrying only authorId: the books cursor is skipped this time
-    t.db.update('posts', 'post1', { authorId: 'A1' });
-    t.flush();
+    await t.db.updateAsync('posts', 'post1', { authorId: 'A1' });
+    await t.flush();
     check('the skipped one keeps its observer', t.db.live('books').length, 1);
     check('and the second superseded its own', t.db.live('authors').length, 1);
   }
@@ -566,12 +579,12 @@ module.exports = function run() {
     const posts = t.db.coll('posts');
     const comments = t.db.coll('comments');
     const authors = t.db.coll('authors');
-    t.db.insert('authors', { _id: 'A1' });
-    t.db.insert('authors', { _id: 'A2' });
-    t.db.insert('posts', { _id: 'post1' });
-    t.db.insert('comments', { _id: 'c1', postId: 'post1', authorId: 'A1' });
+    await t.db.insertAsync('authors', { _id: 'A1' });
+    await t.db.insertAsync('authors', { _id: 'A2' });
+    await t.db.insertAsync('posts', { _id: 'post1' });
+    await t.db.insertAsync('comments', { _id: 'c1', postId: 'post1', authorId: 'A1' });
 
-    t.publish(function () {
+    await t.publish(function () {
       const join = this.relations.join(authors);
       this.relations.cursor(posts.find({}), function (id) {
         this.relations.observeChanges(comments.find({ postId: id }), {
@@ -587,12 +600,12 @@ module.exports = function run() {
     check('the observe publishes nothing itself', t.isPublished('comments', 'c1'), false);
     check('but its push reached the join', t.isPublished('authors', 'A1'), true);
 
-    t.db.insert('comments', { _id: 'c2', postId: 'post1', authorId: 'A2' }); // a later event
-    t.flush();
+    await t.db.insertAsync('comments', { _id: 'c2', postId: 'post1', authorId: 'A2' }); // a later event
+    await t.flush();
     check('a later push reaches the join too', t.isPublished('authors', 'A2'), true);
 
-    t.db.remove('posts', 'post1'); // the contributor that created the observe leaves
-    t.flush();
+    await t.db.removeAsync('posts', 'post1'); // the contributor that created the observe leaves
+    await t.flush();
     check('both pushes are released with it', [t.isPublished('authors', 'A1'), t.isPublished('authors', 'A2')], [false, false]);
     check('and nothing is left to observe', t.db.live('authors').length, 0);
   }
@@ -602,11 +615,11 @@ module.exports = function run() {
     const t = build();
     const posts = t.db.coll('posts');
     const authors = t.db.coll('authors');
-    t.db.insert('authors', { _id: 'A1' });
-    t.db.insert('authors', { _id: 'A2' });
-    t.db.insert('posts', { _id: 'post1', authorId: 'A1' });
+    await t.db.insertAsync('authors', { _id: 'A1' });
+    await t.db.insertAsync('authors', { _id: 'A2' });
+    await t.db.insertAsync('posts', { _id: 'post1', authorId: 'A1' });
 
-    t.publish(function () {
+    await t.publish(function () {
       const join = this.relations.join(authors);
       this.relations.cursor(posts.find({}), {
         added(id, doc) {
@@ -621,8 +634,8 @@ module.exports = function run() {
     });
     check('the added push is published', t.isPublished('authors', 'A1'), true);
 
-    t.db.remove('posts', 'post1');
-    t.flush();
+    await t.db.removeAsync('posts', 'post1');
+    await t.flush();
     check('the removed push belongs to the document too', [t.isPublished('authors', 'A1'), t.isPublished('authors', 'A2')], [false, false]);
     check('leaving nothing to observe', t.db.live('authors').length, 0);
   }
@@ -636,11 +649,11 @@ module.exports = function run() {
     const t = build();
     const posts = t.db.coll('posts');
     const authors = t.db.coll('authors');
-    t.db.insert('authors', { _id: 'A1' });
-    t.db.insert('posts', { _id: 'post1', authorId: 'A1' });
+    await t.db.insertAsync('authors', { _id: 'A1' });
+    await t.db.insertAsync('posts', { _id: 'post1', authorId: 'A1' });
 
     const sawMethods = {};
-    t.publish(function () {
+    await t.publish(function () {
       const join = this.relations.join(authors);
       this.relations.cursor(posts.find({}), {
         added(id, doc) {
@@ -657,16 +670,16 @@ module.exports = function run() {
     });
     check('added gets the methods', sawMethods.added, true);
 
-    let threw = false;
-    try {
-      t.db.remove('posts', 'post1');
-    } catch (error) {
-      threw = true;
-    }
-    t.flush();
+    await t.db.removeAsync('posts', 'post1');
+    await t.flush();
 
     check('so does removed', sawMethods.removed, true);
-    check('the throw was not swallowed', threw, true);
+    // Not swallowed by the package - it comes back out of the callback. Where it
+    // ends up is Meteor's business and it is the same on both sides of the
+    // Meteor 3 line: the multiplexer only catches what a live callback throws,
+    // to log it (ObserveMultiplexer._applyCallback), which is what the harness
+    // records here.
+    check('the throw came back out', t.db.errors.map(error => error.message), ['a callback may throw']);
     check('but the contribution was released anyway', [t.isPublished('authors', 'A1'), t.db.live('authors').length], [false, 0]);
   }
 
@@ -680,11 +693,11 @@ module.exports = function run() {
     const t = build();
     const posts = t.db.coll('posts');
     const comments = t.db.coll('comments');
-    t.db.insert('posts', { _id: 'p1' });
-    t.db.insert('comments', { _id: 'c1', postId: 'p1' });
+    await t.db.insertAsync('posts', { _id: 'p1' });
+    await t.db.insertAsync('comments', { _id: 'c1', postId: 'p1' });
 
     const seen = {};
-    t.publish(function () {
+    await t.publish(function () {
       seen.topIsSub = this === t.sub;
       seen.topApi = typeof this.relations.cursor === 'function';
       this.relations.cursor(posts.find({}), function (id) {
@@ -699,18 +712,150 @@ module.exports = function run() {
     check('and a cursor opened through it publishes', t.isPublished('comments', 'c1'), true);
   }
 
+  // === an async callback cannot let a later event overtake it ==============
+  // ObserveMultiplexer._applyCallback dispatches an event and moves on without
+  // waiting for what the callback hands back, so with no chain of our own the
+  // quick `changed` would reach the merge box before the slow `added` - and
+  // makeSub throws on that exactly where ddp-server does.
+  {
+    const t = build();
+    const posts = t.db.coll('posts');
+
+    await t.publish(function () {
+      this.relations.cursor(posts.find({}), async function (id, doc, changed) {
+        // The add is deliberately the slow one: an unordered implementation
+        // writes the change first and fails on it.
+        await sleep(changed ? 0 : 20);
+      });
+    });
+
+    // Two events for one document with nothing awaited in between - which is
+    // how they arrive from the multiplexer.
+    t.db.insert('posts', { _id: 'p1', v: 0 });
+    t.db.update('posts', 'p1', { v: 1 });
+    await t.db.settle();
+
+    check('the writes follow the events', t.events.map(e => e[0]), ['added', 'changed']);
+    check('and nothing threw on the way', t.db.errors.map(e => e.message), []);
+  }
+
+  // === the same for a removal overtaking its own add =======================
+  {
+    const t = build();
+    const posts = t.db.coll('posts');
+
+    await t.publish(function () {
+      this.relations.cursor(posts.find({}), {
+        async added () {
+          await sleep(20);
+        },
+        changed () {},
+        removed () {},
+      });
+    });
+
+    t.db.insert('posts', { _id: 'p1' });
+    t.db.remove('posts', 'p1');
+    await t.db.settle();
+
+    check('a removal cannot overtake the add it undoes', t.events.map(e => e[0]), ['added', 'removed']);
+    check('and nothing threw on the way', t.db.errors.map(e => e.message), []);
+  }
+
+  // === one chain per document, not per publication =========================
+  // _sendAdds fires every initial add at once and settles them together, so two
+  // documents must still be in flight at the same time. A single queue for the
+  // whole publication would turn that into one callback after another.
+  {
+    const t = build();
+    const posts = t.db.coll('posts');
+    await t.db.insertAsync('posts', { _id: 'p1' });
+    await t.db.insertAsync('posts', { _id: 'p2' });
+
+    const started = [];
+    let startedWhenFirstFinished = null;
+
+    await t.publish(function () {
+      this.relations.cursor(posts.find({}), async function (id) {
+        started.push(id);
+        await sleep(10);
+        if (startedWhenFirstFinished === null) startedWhenFirstFinished = started.length;
+      });
+    });
+
+    check('initial adds overlap', startedWhenFirstFinished, 2);
+    check('and both documents went out', [t.isPublished('posts', 'p1'), t.isPublished('posts', 'p2')], [true, true]);
+  }
+
+  // === a registration that fails fails the publication =====================
+  // The frame drops a rejected registration from _pending like any other, so
+  // the failure has to be remembered: an async body keeps working after opening
+  // a cursor, and by the time _settle() looks there would be nothing left to
+  // reject with. Going ready on a cursor that was never registered is the one
+  // outcome that must not happen quietly.
+  {
+    const t = build();
+    const posts = t.db.coll('posts');
+    const broken = posts.find({});
+    broken.observeChangesAsync = () => Promise.reject(new Error('mongo said no'));
+
+    let reported = null;
+    try {
+      await t.publish(async function () {
+        this.relations.cursor(broken);
+        await sleep(5);
+      });
+    } catch (error) {
+      reported = error.message;
+    }
+
+    check('the failed registration reaches the publication', reported, 'mongo said no');
+  }
+
+  // === a callback may reopen what it is running under ======================
+  // Both serialisers key on something a callback can reach again from inside
+  // itself: the write queue on the document being written, the observe lock on
+  // the cursor description being registered. Queueing behind either would be
+  // waiting for itself, so runSerial() runs a re-entrant job inline. Without
+  // that this publication never finishes - no error, just a subscription that
+  // is never ready.
+  {
+    const t = build();
+    const posts = t.db.coll('posts');
+    await t.db.insertAsync('posts', { _id: 'p1' });
+
+    let nested = false;
+    const publishing = t.publish(function () {
+      this.relations.cursor(posts.find({}), function (id) {
+        nested = true;
+        // Same cursor description as the parent, under its own name so the two
+        // do not fight over one slot.
+        this.relations.cursor(posts.find({}), 'postsCopy');
+      });
+    });
+
+    const outcome = await Promise.race([
+      publishing.then(() => 'finished'),
+      new Promise(resolve => setTimeout(() => resolve('deadlocked'), 500)),
+    ]);
+
+    check('the nested callback ran', nested, true);
+    check('and the publication finished', outcome, 'finished');
+    check('both cursors published the document', [t.isPublished('posts', 'p1'), t.isPublished('postsCopy', 'p1')], [true, true]);
+  }
+
   // === joinNonreactive publishes once and observes nothing =================
   {
     const t = build();
     const posts = t.db.coll('posts');
     const authors = t.db.coll('authors');
-    t.db.insert('authors', { _id: 'A1' });
-    t.db.insert('authors', { _id: 'A2' });
-    t.db.insert('posts', { _id: 'post1', authorId: 'A1' });
+    await t.db.insertAsync('authors', { _id: 'A1' });
+    await t.db.insertAsync('authors', { _id: 'A2' });
+    await t.db.insertAsync('posts', { _id: 'post1', authorId: 'A1' });
 
     const handed = [];
     let join = null;
-    t.publish(function () {
+    await t.publish(function () {
       join = this.relations.joinNonreactive(authors);
       join.selector = _id => {
         handed.push(_id.$in);
@@ -746,10 +891,10 @@ module.exports = function run() {
   {
     const t = build();
     const books = t.db.coll('books');
-    t.db.insert('books', { _id: 'B1', title: 'orig' });
+    await t.db.insertAsync('books', { _id: 'B1', title: 'orig' });
 
     const seen = {};
-    t.publish(function () {
+    await t.publish(function () {
       this.relations.cursor(books.find({}), 'reactive', function (id, doc) {
         seen.reactive = doc;
       });

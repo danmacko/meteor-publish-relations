@@ -31,7 +31,9 @@ const stripModuleSyntax = src =>
 // Meteor stub.
 function loadModules(relPaths, globals) {
   const src = relPaths.map(p => stripModuleSyntax(fs.readFileSync(path.join(LIB, p), 'utf8'))).join('\n');
-  const sandbox = Object.assign({ console }, globals);
+  // EJSON is only ever used as a lock key here (observe-lock.js), so the plain
+  // JSON encoder stands in for it.
+  const sandbox = Object.assign({ console, EJSON: { stringify: value => JSON.stringify(value) } }, globals);
   vm.createContext(sandbox);
   // Re-export the declarations the tests need; `this` is the sandbox.
   const exposed = [
@@ -102,21 +104,25 @@ function makeMeteorStub(extra) {
     extra
   );
   // Runs queued callbacks until the queue drains (a restart may queue another).
-  Meteor._flush = function (maxRounds = 20) {
+  // Awaited one at a time: a deferred reconcile is asynchronous now, and a test
+  // that flushes wants the restart finished, not merely started. Meteor itself
+  // ignores what a deferred callback returns - waiting for it is the harness
+  // standing in for "and then some time passed".
+  Meteor._flush = async function (maxRounds = 20) {
     let rounds = 0;
-    while (queue.length && rounds++ < maxRounds) queue.splice(0).forEach(fn => fn());
+    while (queue.length && rounds++ < maxRounds) {
+      for (const fn of queue.splice(0)) await fn();
+    }
   };
   // Fires pending setTimeout callbacks, earliest delay first, and drains what
   // they defer. Deliberately NOT part of _flush, so a test can assert that a
   // retry is still only scheduled.
-  Meteor._flushTimers = function (maxRounds = 20) {
+  Meteor._flushTimers = async function (maxRounds = 20) {
     let rounds = 0;
     while (timers.length && rounds++ < maxRounds) {
-      timers
-        .splice(0)
-        .sort((a, b) => a.delay - b.delay)
-        .forEach(t => t.fn());
-      Meteor._flush();
+      const due = timers.splice(0).sort((a, b) => a.delay - b.delay);
+      for (const timer of due) await timer.fn();
+      await Meteor._flush();
     }
   };
   Meteor._pendingTimers = () => timers.length;
@@ -187,6 +193,12 @@ class FakeDB {
   constructor() {
     this.colls = {};
     this.observers = [];
+    // Live-event callbacks that have not finished yet, and whatever they threw.
+    // Both exist because Meteor 3 does not wait for them (see _dispatch): a test
+    // drives them to completion with settle(), and reads errors to tell "the
+    // write threw" from "the write did not happen".
+    this.inflight = [];
+    this.errors = [];
   }
   coll(name) {
     if (!this.colls[name]) this.colls[name] = new Map();
@@ -198,12 +210,21 @@ class FakeDB {
       _cursorDescription: { collectionName: name, selector },
       _getCollectionName: () => name,
       // One-shot read, no observer - what the nonreactive API runs on.
-      forEach(fn) {
+      // AsynchronousCursor.forEach awaits each callback before reading the next
+      // document, so this does too.
+      async forEachAsync(fn) {
+        const docs = [];
         db.colls[name].forEach(doc => {
-          if (matches(doc, selector)) fn(Object.assign({}, doc));
+          if (matches(doc, selector)) docs.push(Object.assign({}, doc));
         });
+        for (const doc of docs) await fn(doc);
       },
-      observeChanges(callbacks) {
+      // ObserveMultiplexer._sendAdds collects what the added callbacks hand back
+      // and settles all of them before the handle is returned, so an async
+      // callback still finishes within the registration. Live events are the
+      // opposite (see _dispatch) - that asymmetry is Meteor's, and reproducing
+      // it here is the point of this harness.
+      async observeChangesAsync(callbacks) {
         const observer = {
           coll: name,
           selector,
@@ -217,15 +238,63 @@ class FakeDB {
           },
         };
         db.observers.push(observer);
+
+        const adds = [];
         db.colls[name].forEach((doc, id) => {
           if (matches(doc, selector)) {
             observer.ids.add(id);
-            callbacks.added(id, fieldsOf(doc));
+            adds.push(callbacks.added(id, fieldsOf(doc)));
           }
         });
+
+        const settled = await Promise.allSettled(adds);
+        settled.forEach(result => {
+          if (result.status === 'rejected') db.errors.push(result.reason);
+        });
+
         return observer;
       },
     };
+  }
+  // ObserveMultiplexer._applyCallback: the callback is invoked and what it hands
+  // back is only .catch()ed for logging - the queue moves on to the next event
+  // without waiting. So an async callback's write can land after a later event's,
+  // which is exactly the reordering the package has to prevent by itself.
+  _dispatch(fn) {
+    let running;
+    try {
+      running = fn();
+    } catch (error) {
+      this.errors.push(error);
+      return;
+    }
+
+    if (running && typeof running.then === 'function') {
+      this.inflight.push(running.catch(error => this.errors.push(error)));
+    }
+  }
+  // Runs the dispatched work to completion. Not a guarantee Meteor makes - it is
+  // how a test says "and then everything that was in flight finished".
+  async settle() {
+    while (this.inflight.length) {
+      await Promise.all(this.inflight.splice(0));
+    }
+  }
+  // The three a test normally reaches for: mutate, then let the dispatched
+  // callbacks finish. Named after the Meteor 3 collection API they stand in for,
+  // and awaited for the same reason. Firing two events with no await in between
+  // - which is what provokes a reordering - is done with the sync trio below.
+  async insertAsync(name, doc) {
+    this.insert(name, doc);
+    await this.settle();
+  }
+  async updateAsync(name, id, fields) {
+    this.update(name, id, fields);
+    await this.settle();
+  }
+  async removeAsync(name, id) {
+    this.remove(name, id);
+    await this.settle();
   }
   insert(name, doc) {
     this.coll(name);
@@ -233,7 +302,7 @@ class FakeDB {
     this.observers.slice().forEach(o => {
       if (o.coll === name && matches(doc, o.selector)) {
         o.ids.add(doc._id);
-        o.callbacks.added(doc._id, fieldsOf(doc));
+        this._dispatch(() => o.callbacks.added(doc._id, fieldsOf(doc)));
       }
     });
   }
@@ -243,13 +312,13 @@ class FakeDB {
       if (o.coll !== name) return;
       const now = matches(doc, o.selector);
       const had = o.ids.has(id);
-      if (now && had) o.callbacks.changed(id, fields);
+      if (now && had) this._dispatch(() => o.callbacks.changed(id, fields));
       else if (now && !had) {
         o.ids.add(id);
-        o.callbacks.added(id, fieldsOf(doc));
+        this._dispatch(() => o.callbacks.added(id, fieldsOf(doc)));
       } else if (!now && had) {
         o.ids.delete(id);
-        o.callbacks.removed(id);
+        this._dispatch(() => o.callbacks.removed(id));
       }
     });
   }
@@ -258,7 +327,7 @@ class FakeDB {
     this.observers.slice().forEach(o => {
       if (o.coll === name && o.ids.has(id)) {
         o.ids.delete(id);
-        o.callbacks.removed(id);
+        this._dispatch(() => o.callbacks.removed(id));
       }
     });
   }

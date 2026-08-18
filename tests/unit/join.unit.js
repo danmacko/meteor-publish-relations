@@ -5,7 +5,7 @@
 
 const { loadModules, makeMeteorStub, createReporter, makeSub, strategies } = require('./harness');
 
-module.exports = function run() {
+module.exports = async function run() {
   const { check, report } = createReporter('unit: CursorJoin');
 
   // A join needs CursorMethods only as a prototype host, so stub it. Contributors
@@ -14,7 +14,7 @@ module.exports = function run() {
   function build(subOptions) {
     const Meteor = makeMeteorStub();
     const sandbox = loadModules(
-      ['cursor/published.js', 'cursor/contributor-context.js', 'handler_controller.js', 'cursor/join.js'],
+      ['thenable.js', 'serial.js', 'observe-lock.js', 'cursor/write-queue.js', 'cursor/published.js', 'cursor/contributor-context.js', 'handler_controller.js', 'cursor/join.js'],
       { Meteor, CursorMethods: class {} }
     );
     const { sub, events, isPublished } = makeSub(subOptions);
@@ -28,9 +28,9 @@ module.exports = function run() {
       // Enough of CursorMethods.cursor for the join: it registers a slot under
       // the join's registry key and fills it, so the join's own release path
       // (handler.remove) has something to find and stop.
-      cursor: (...args) => {
+      cursor: async (...args) => {
         cursorCalls.push(args);
-        const slot = handler.add({ _cursorDescription: { collectionName: 'authors' } }, {
+        const slot = await handler.add({ _cursorDescription: { collectionName: 'authors' } }, {
           collection: 'authors',
           key: args[3],
         });
@@ -38,6 +38,11 @@ module.exports = function run() {
         observes.push(observe);
         return slot.set(observe);
       },
+      // The frame bookkeeping the join leans on (CursorMethodsNR): nothing else
+      // registers anything here, so tracking is a pass-through and there is
+      // never anything started before send().
+      _track: promise => promise,
+      _settleStarted: () => Promise.resolve(),
       _nextRegistryKey: (name, kind) => {
         const bucket = name + '#' + kind;
         const seq = seqs[bucket] || 0;
@@ -73,13 +78,13 @@ module.exports = function run() {
     const t = build();
     t.sub.added('authors', 'a1'); // a1 was published; a2 never matched
     t.pushAs('c1', 'a1', 'a2');
-    t.join.send();
+    await t.join.send();
     t.cursorCalls.length = 0;
 
     t.stopOwner('c1');
     check('retraction does not run inline', t.events.filter(e => e[0] === 'removed').length, 0);
 
-    t.flush();
+    await t.flush();
     check(
       'retracts the published id',
       t.events.filter(e => e[0] === 'removed').map(e => e[2]),
@@ -96,10 +101,10 @@ module.exports = function run() {
     const t = build();
     t.sub.added('authors', objectLike);
     t.pushAs('c1', objectLike);
-    t.join.send();
+    await t.join.send();
 
     t.stopOwner('c1');
-    t.flush();
+    await t.flush();
     check(
       'object-id-shaped id is matched',
       t.events.filter(e => e[0] === 'removed').map(e => e[2]),
@@ -112,12 +117,12 @@ module.exports = function run() {
     const t = build();
     t.sub.added('authors', 'a1');
     t.pushAs('c1', 'a1');
-    t.join.send();
+    await t.join.send();
 
     t.stopOwner('c1');
     t.pushAs('c2', 'a1');
     t.stopOwner('c2');
-    t.flush();
+    await t.flush();
     check('duplicate release removes once', t.events.filter(e => e[0] === 'removed').length, 1);
   }
 
@@ -126,11 +131,11 @@ module.exports = function run() {
     const t = build();
     t.sub.added('authors', 'a1');
     t.pushAs('c1', 'a1');
-    t.join.send();
+    await t.join.send();
 
     t.stopOwner('c1');
     t.pushAs('c2', 'a1'); // another contributor picks it back up
-    t.flush();
+    await t.flush();
     check('re-joined id is not retracted', t.events.filter(e => e[0] === 'removed').length, 0);
     check('re-joined id stays in the $in', t.join.data, ['a1']);
   }
@@ -145,7 +150,7 @@ module.exports = function run() {
     t.cursorCalls.length = 0;
     t.sub._deactivated = true;
 
-    t.flush();
+    await t.flush();
     check('no retraction after teardown', t.events.filter(e => e[0] === 'removed').length, 0);
     check('no observe restart after teardown', t.cursorCalls.length, 0);
   }
@@ -154,9 +159,9 @@ module.exports = function run() {
   {
     const t = build({ strategy: strategies.NO_MERGE_NO_HISTORY });
     t.pushAs('c1', 'a1', 'a2');
-    t.join.send();
+    await t.join.send();
     t.stopOwner('c1');
-    t.flush();
+    await t.flush();
     check('no _documents proof -> no retraction', t.events.filter(e => e[0] === 'removed').length, 0);
   }
 
@@ -167,9 +172,9 @@ module.exports = function run() {
     delete t.sub._session; // getPublicationStrategy gone
     delete t.sub._idFilter; // _idFilter gone -> identity fallback
     t.pushAs('c1', 'a1', 'a2');
-    t.join.send();
+    await t.join.send();
     t.stopOwner('c1');
-    t.flush();
+    await t.flush();
     check(
       'survives renamed internals',
       t.events.filter(e => e[0] === 'removed').map(e => e[2]),
@@ -185,13 +190,13 @@ module.exports = function run() {
     t.pushAs('c2', 'a2');
     t.pushAs('c3', 'a3');
     t.pushAs('c4', 'a4'); // stays, so this is a restart and not the empty case
-    t.join.send();
+    await t.join.send();
     t.cursorCalls.length = 0;
 
     t.stopOwner('c1');
     t.stopOwner('c2');
     t.stopOwner('c3');
-    t.flush();
+    await t.flush();
     check('three releases -> one restart', t.cursorCalls.length, 1);
     check('all three retracted', t.events.filter(e => e[0] === 'removed').length, 3);
   }
@@ -200,28 +205,28 @@ module.exports = function run() {
   {
     const t = build();
     t.pushAs('c1', 'a1');
-    t.join.send();
+    await t.join.send();
     t.cursorCalls.length = 0;
 
     t.pushAs('c2', 'a1'); // same id, second contributor -> union is unchanged
-    t.flush();
+    await t.flush();
     check('unchanged membership -> no restart', t.cursorCalls.length, 0);
     check('the contribution was still recorded', t.join.contributions.size, 2);
 
     t.stopOwner('c1'); // ...and it is what keeps the id alive now
-    t.flush();
+    await t.flush();
     check('still no restart, the id is still held', t.cursorCalls.length, 0);
     check('the id survives its first contributor', t.join.data, ['a1']);
 
     t.stopOwner('c2');
-    t.flush();
+    await t.flush();
     check('the last contributor leaving empties the $in', t.join.data, []);
     // An observe over {$in: []} can never match and still costs a multiplexer
     // (and an oplog trigger), so the slot goes instead.
     check('and the observe goes with it', [t.cursorCalls.length, t.liveObserves()], [0, 0]);
 
     t.pushAs('c3', 'a9'); // the join is not dead, only idle
-    t.flush();
+    await t.flush();
     check('a later push builds a fresh observe', [t.cursorCalls.length, t.liveObserves()], [1, 1]);
   }
 
@@ -229,13 +234,13 @@ module.exports = function run() {
   {
     const t = build();
     t.pushAs('c1', 'a1');
-    t.join.send();
+    await t.join.send();
     t.cursorCalls.length = 0;
 
     const orphan = t.owner('c2');
     orphan.stop(); // its document left the result set while its callback yielded
     t.sandbox.runInContributor(orphan, () => t.join.push('a2'));
-    t.flush();
+    await t.flush();
 
     check('the orphaned push is not recorded', t.join.contributions.has(orphan), false);
     check('and never reaches the $in', t.join.data, ['a1']);
@@ -264,11 +269,11 @@ module.exports = function run() {
     ['a1', 'a2'].forEach(id => t.sub.added('authors', id));
     t.pushAs('parent', 'a1');
     t.sandbox.runInContributor(t.owner('parent', 'nested'), () => t.join.push('a2'));
-    t.join.send();
+    await t.join.send();
     check('both contributions are in the $in', t.join.data.slice().sort(), ['a1', 'a2']);
 
     t.stopOwner('parent'); // the nested controller is a child, so stop() recurses
-    t.flush();
+    await t.flush();
     check('parent and nested ids both released', t.join.data, []);
     check(
       'both retracted',
@@ -280,14 +285,14 @@ module.exports = function run() {
   // --- the deferred restart does not inherit the contributor that pushed ---
   {
     const t = build();
-    t.join.send(); // sent, so the next push schedules a restart
+    await t.join.send(); // sent, so the next push schedules a restart
     let frameDuringRestart = 'unset';
     t.join.methods.cursor = () => {
       frameDuringRestart = t.sandbox.currentContributor();
     };
 
     t.pushAs('c1', 'a1');
-    t.flush();
+    await t.flush();
     check('restart runs with no contributor frame', frameDuringRestart, null);
   }
 
@@ -296,7 +301,7 @@ module.exports = function run() {
     const t = build();
     t.sub.added('authors', 'a1');
     t.pushAs('c1', 'a1');
-    t.join.send();
+    await t.join.send();
     t.cursorCalls.length = 0;
 
     let failuresLeft = 2;
@@ -307,11 +312,11 @@ module.exports = function run() {
     };
 
     t.pushAs('c2', 'a2');
-    t.flush();
+    await t.flush();
     check('the failed attempt left no observe', t.cursorCalls.length, 0);
     check('a retry is scheduled', t.Meteor._pendingTimers(), 1);
 
-    t.Meteor._flushTimers();
+    await t.Meteor._flushTimers();
     check('the retry restarts the observe', t.cursorCalls.length, 1);
     check('recovery is silent', t.Meteor._debugs.length, 0);
   }
@@ -323,7 +328,7 @@ module.exports = function run() {
     t.sub.added('authors', 'a2');
     t.pushAs('c1', 'a1');
     t.pushAs('c2', 'a2'); // stays, so the join still has something to observe
-    t.join.send();
+    await t.join.send();
     t.cursorCalls.length = 0;
 
     let failed = false;
@@ -335,8 +340,8 @@ module.exports = function run() {
     };
 
     t.stopOwner('c1');
-    t.flush();
-    t.Meteor._flushTimers();
+    await t.flush();
+    await t.Meteor._flushTimers();
     check('the observe came back', t.cursorCalls.length, 1);
     check(
       'the retraction was sent exactly once',
@@ -349,15 +354,15 @@ module.exports = function run() {
   {
     const t = build();
     t.pushAs('c1', 'a1');
-    t.join.send();
+    await t.join.send();
     t.cursorCalls.length = 0;
     t.join.methods.cursor = () => {
       throw new Error('mongo is down');
     };
 
     t.pushAs('c2', 'a2');
-    t.flush();
-    t.Meteor._flushTimers();
+    await t.flush();
+    await t.Meteor._flushTimers();
 
     check('no observe was created', t.cursorCalls.length, 0);
     check('no retry left dangling', t.Meteor._pendingTimers(), 0);
@@ -371,14 +376,14 @@ module.exports = function run() {
   // do - and, with no observer up yet, builds one over an empty {$in}.
   {
     const t = build();
-    t.join.send(); // nothing collected, so no observer
+    await t.join.send(); // nothing collected, so no observer
     check('send builds nothing for an empty join', t.cursorCalls.length, 0);
 
     t.sandbox.runInContributor(t.owner('c1'), () => t.join.push(undefined));
     check('a push of nothing records no contributor', t.join.contributions.size, 0);
 
     t.stopOwner('c1');
-    t.flush();
+    await t.flush();
     check('and its contributor leaving builds nothing either', t.cursorCalls.length, 0);
     check('the $in is still empty', t.join.data, []);
   }
@@ -396,12 +401,12 @@ module.exports = function run() {
       throw new Error('transient mongo error');
     };
 
-    t.join.send(); // must not propagate - that would nosub the whole publication
+    await t.join.send(); // must not propagate - that would nosub the whole publication
     check('the first attempt failed', failed, true);
     check('no observe yet', t.cursorCalls.length, 0);
     check('but a retry is scheduled', t.Meteor._pendingTimers(), 1);
 
-    t.Meteor._flushTimers();
+    await t.Meteor._flushTimers();
     check('and it comes up on the retry', t.cursorCalls.length, 1);
   }
 
@@ -414,33 +419,33 @@ module.exports = function run() {
   {
     const t = build();
     t.pushAs('c1', 'a1');
-    t.join.send();
+    await t.join.send();
     t.cursorCalls.length = 0;
 
     const realCursor = t.join.methods.cursor;
     let reentered = false;
 
-    t.join.methods.cursor = (...args) => {
+    t.join.methods.cursor = async (...args) => {
       if (!reentered) {
         reentered = true;
         t.pushAs('c2', 'a2'); // lands while this _cursor() is still "yielding"
         t.join.methods.cursor = () => {
           throw new Error('transient mongo error');
         };
-        t.flush(); // the second reconcile runs, fails, and schedules a retry
+        await t.flush(); // the second reconcile runs, fails, and schedules a retry
         t.join.methods.cursor = realCursor;
       }
       return realCursor(...args);
     };
 
     t.pushAs('c3', 'a3');
-    t.flush();
+    await t.flush();
 
     check('the superseded run claimed no observer', t.join._observerLive, false);
     check('the retry it scheduled is still pending', t.Meteor._pendingTimers(), 1);
 
     t.cursorCalls.length = 0;
-    t.Meteor._flushTimers();
+    await t.Meteor._flushTimers();
     check('and the retry does rebuild', t.cursorCalls.length, 1);
     check('leaving a live observer behind', t.join._observerLive, true);
   }
@@ -451,22 +456,22 @@ module.exports = function run() {
   {
     const t = build();
     t.pushAs('c1', 'a1');
-    t.join.send();
+    await t.join.send();
     t.cursorCalls.length = 0;
     t.join.methods.cursor = () => {
       throw new Error('mongo is down');
     };
 
     t.pushAs('c2', 'a2');
-    t.flush();
-    t.Meteor._flushTimers();
+    await t.flush();
+    await t.Meteor._flushTimers();
     check('it gave up', t.Meteor._debugs.filter(d => d.indexOf('gave up restarting') !== -1).length, 1);
 
     // Mongo comes back. The union does not change - a2 is already a member -
     // but there is no observer, so this must NOT take the skip.
     t.join.methods.cursor = (...args) => t.cursorCalls.push(args);
     t.pushAs('c3', 'a2');
-    t.flush();
+    await t.flush();
     check('an observer-less join still rebuilds', t.cursorCalls.length, 1);
   }
 
@@ -478,9 +483,9 @@ module.exports = function run() {
     const a = build();
     const b = build();
     a.pushAs('c1', 'a3', 'a1', 'a2');
-    a.join.send();
+    await a.join.send();
     b.pushAs('c1', 'a1', 'a2', 'a3');
-    b.join.send();
+    await b.join.send();
     check('same members, different push order -> same selector', a.join._selector(), b.join._selector());
   }
 
@@ -492,13 +497,13 @@ module.exports = function run() {
     warm.pushAs('c1', 'a1');
     warm.pushAs('c2', 'a2');
     warm.pushAs('c3', 'a3');
-    warm.join.send();
+    await warm.join.send();
     warm.stopOwner('c2'); // a2's contributor goes away...
     warm.pushAs('c4', 'a2'); // ...and another picks it up, at the end of the union
-    warm.flush();
+    await warm.flush();
 
     fresh.pushAs('c1', 'a1', 'a2', 'a3');
-    fresh.join.send();
+    await fresh.join.send();
 
     check('a churned join matches a fresh one with the same members', warm.join._selector(), fresh.join._selector());
     check('and the underlying data really had drifted', warm.join.data, ['a1', 'a3', 'a2']);
@@ -509,7 +514,7 @@ module.exports = function run() {
     const t = build();
     t.join.selector = _ids => ({ postId: _ids });
     t.pushAs('c1', 'a3', 'a1');
-    t.join.send();
+    await t.join.send();
     check('custom selector receives sorted ids', t.join._selector(), { postId: { $in: ['a1', 'a3'] } });
   }
 
